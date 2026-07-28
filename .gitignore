@@ -1,0 +1,24 @@
+# Search outputs (can reach tens of GB; keep the package marker only)
+/output/*
+!output/__init__.py
+
+# Local SPICE meta-kernel. Copy star/METAKERN.tm.template and edit PATH_VALUES.
+star/METAKERN.tm
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Environments and editor/tool state
+.venv/
+.claude/
+
+# Profiling artifacts
+*.prof
+
+# Scratch work
+sandbox/

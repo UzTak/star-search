@@ -1,0 +1,37 @@
+[project]
+name = "star-search"
+version = "0.1.0"
+description = "Star search: interplanetary trajectory design tool"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Yuji Takubo", email = "ytakubo@stanford.edu" }]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "spiceypy>=6.0",
+    "numba>=0.59",
+    "matplotlib>=3.8",
+    "scipy>=1.15.3",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["star", "example"]
+
+[project.scripts]
+star-search = "star.pipeline:main"
+star-plot = "star.plotter:main"
+star-memory = "star.memory_report:main"
+
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

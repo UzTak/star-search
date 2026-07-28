@@ -1,0 +1,63 @@
+KPL/MK
+
+   Star SPICE meta-kernel template.
+
+   SETUP
+   -----
+   1. Copy this file to `star/METAKERN.tm` (that path is git-ignored, so your
+      local absolute paths never get committed).
+   2. Download the kernels listed below from NAIF.
+   3. Edit PATH_VALUES to point at the directory you downloaded them into.
+
+   All kernels below are NAIF *generic* kernels, mirrored under
+   https://naif.jpl.nasa.gov/pub/naif/generic_kernels/
+
+      lsk/naif0012.tls                        leapseconds (required)
+      spk/planets/de440.bsp                   planetary barycenters (required)
+      spk/satellites/mar099.bsp               Mars (499)
+      spk/satellites/jup365.bsp               Jupiter (599) + Galilean moons
+      spk/satellites/sat457.bsp               Saturn (699)
+      spk/satellites/ura184_part-1.bsp        Uranus (799)
+      spk/satellites/ura111xl-799.bsp         Uranus (799), extended coverage
+      pck/gm_de440.tpc                        GM values (optional, see note)
+
+   Which ones do I actually need?
+      naif0012.tls and de440.bsp are always required. The satellite SPKs are
+      only needed for the bodies your problem visits: de440 provides planetary
+      *barycenters*, so a flyby targeting body 499/599/699/799 by its own NAIF
+      ID needs the matching satellite kernel. Newer versions (e.g. de441,
+      jup380) work as long as the body IDs and epoch coverage are there.
+
+      gm_de440.tpc is listed for completeness but Star does not read GM or
+      radii from SPICE -- those come from tables in `star/constants/`. Star
+      calls only furnsh, str2et, and spkezr.
+
+   Example coverage:
+      earth_to_jupiter, test1_DVEGA, test2_EMEJ   de440 + mar099 + jup365
+      jovian_petal                                de440 + jup365
+      earth_to_saturn                             ... + sat457
+      earth_to_uranus                             ... + sat457 + ura*
+      bepicolombo                                 de440 (Mercury is in de440)
+
+   PATH_VALUES must be an absolute path. On Windows use forward slashes.
+   Each entry is limited to 80 characters; if your path is longer, split it
+   across several PATH_VALUES/PATH_SYMBOLS pairs (see the NAIF Kernel
+   Required Reading).
+
+\begindata
+
+   PATH_VALUES  = ( '/absolute/path/to/naif/generic_kernels' )
+   PATH_SYMBOLS = ( 'KERNELS' )
+
+   KERNELS_TO_LOAD = (
+      '$KERNELS/lsk/naif0012.tls',
+      '$KERNELS/spk/planets/de440.bsp',
+      '$KERNELS/spk/satellites/mar099.bsp',
+      '$KERNELS/spk/satellites/jup365.bsp',
+      '$KERNELS/spk/satellites/sat457.bsp',
+      '$KERNELS/spk/satellites/ura184_part-1.bsp',
+      '$KERNELS/spk/satellites/ura111xl-799.bsp',
+      '$KERNELS/pck/gm_de440.tpc'
+   )
+
+\begintext
