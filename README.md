@@ -13,6 +13,8 @@ This codebase summarizes the three algorithms shown here: (Star search logic [1]
 
 [3] Arora, N., Russell, R.P. (2013). A fast and robust multiple revolution Lambert algorithm using a cosine transformation. AAS/AIAA Astrodynamics Specialist Conference, AAS 13-728, Hilton Head, SC. 
 
+Disclaimer: This codebase is an independent re-implementation of the method presented in [1]. Its performance may differ from, and potentially be lower than, the results reported in the original paper. The repository is intended to provide an open-source benchmark and to promote broader use and evaluation of the Star.
+
 ## Quick Start
 
 ### 1. Installation
