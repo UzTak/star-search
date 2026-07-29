@@ -2,7 +2,7 @@
 
 <img width="703" height="353" alt="Screenshot 2026-07-28 125846" src="https://github.com/user-attachments/assets/8ed7281c-cc0e-4f82-a9ae-aeb377083409" />
 
-**Star** [1] is a broad-search algorithm for patched-conic interplanetary mission design. 
+**Star** [1] is a broad-search algorithm for patched-conic interplanetary mission design, originally developed by Damon Landau. 
 The unique advantage of this algorithm is that the search time is polynomial by adopting the philosophy of "patch pre-generated Lambert arcs" via powered flyby (i.e., $\Delta V$ at the patch point) with the discretized encounter epochs with each planetary body. With additional heuristics, Star enables a scalable broad-search for multi-flyby trajectories and serves as a strong preliminary trajectory design/analysis tool. 
 
 This codebase summarizes the three algorithms shown here: (Star search logic [1], Efficient mid-arc maneuver placement algorithm [2], and Lambert solver [3]). 
