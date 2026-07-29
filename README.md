@@ -121,7 +121,7 @@ uv run pytest
 
 ## Acknowledgement
 
-Special thanks to Star authors (Damon Landau, Stefano Campagnola, and Etienne Pellegrini) for insightful discussions and cross-validations of preliminary results. 
+Special thanks to Damon Landau, Stefano Campagnola, and Etienne Pellegrini for insightful discussions, cross-validations of preliminary results, and overall support on this project. 
 AI coding tools are used extensively to make this codebase. 
 
 ## License
