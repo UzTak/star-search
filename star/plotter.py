@@ -3,6 +3,7 @@
 This module reconstructs observer-centered spacecraft leg states without Lambert:
 - departure state per leg is `r0 = r_body`, `v0 = v_body + v_inf_departure`,
 - propagation uses two-body Kepler universal variables about the selected central body,
+- low-thrust legs replay their saved primer control with thrust arrows and endpoint errors,
 - projection is 2D x-y in the selected inertial frame (default ECLIPJ2000).
 - includes utilities to plot DV-vs-TOF Pareto fronts from solution JSONL rows.
 """
@@ -28,6 +29,7 @@ root_folder = Path.cwd()
 
 from star.constants import DEFAULT_FRAME, DEFAULT_OBSERVER, get_gm
 from star.lambert import kepler_propagate_universal
+from star.low_thrust import propagate_binned_low_thrust
 
 PLOT_AXIS_METRICS = ("t0", "t", "tf", "tof", "dv")
 PLOT_COLOR_METRICS = (*PLOT_AXIS_METRICS, "fb_seq", "vinf0", "vinf_arr", "inc_arr", "none")
@@ -1240,22 +1242,26 @@ def _connect_trade_plot_pick_handler(
             suffix = out_path.suffix if out_path.suffix else ".png"
             click_save_path = out_path.with_name(f"{out_path.stem}_traj_{traj_id_value}{suffix}")
 
-        traj_fig, _ = plot_trajectory_2d(
-            traj_record=traj_record,
-            mu_central=mu_central,
-            frame=frame,
-            observer=observer,
-            central_body_label=central_body_label,
-            num_samples_leg=int(num_samples_leg),
-            num_samples_orbit=int(num_samples_orbit),
-            axis=axis,
-            include_boundary_dv=include_boundary_dv,
-            closure_pos_tol_km=float(closure_pos_tol_km),
-            closure_vel_tol_km_s=float(closure_vel_tol_km_s),
-            dark=dark,
-            save_path=click_save_path,
-            show=False,
-        )
+        try:
+            traj_fig, _ = plot_trajectory_2d(
+                traj_record=traj_record,
+                mu_central=mu_central,
+                frame=frame,
+                observer=observer,
+                central_body_label=central_body_label,
+                num_samples_leg=int(num_samples_leg),
+                num_samples_orbit=int(num_samples_orbit),
+                axis=axis,
+                include_boundary_dv=include_boundary_dv,
+                closure_pos_tol_km=float(closure_pos_tol_km),
+                closure_vel_tol_km_s=float(closure_vel_tol_km_s),
+                dark=dark,
+                save_path=click_save_path,
+                show=False,
+            )
+        except (ValueError, RuntimeError, FloatingPointError) as exc:
+            warnings.warn(f"traj_id={traj_id_value} trajectory plot failed: {exc}")
+            return
         if click_save_path is not None:
             print(f"saved_trajectory_plot={click_save_path}")
 
@@ -1424,6 +1430,10 @@ def plot_trajectory_2d(
     """Plot patched-conic central-body trajectory in x-y projection.
 
     Reconstruction model:
+    - Positive-acceleration low-thrust legs replay saved `lt_control` and
+      `lt_n_rev`, with acceleration arrows projected into the same x-y frame.
+      First-order search legs are labeled and their nonlinear endpoint miss shown.
+      Use the same inertial frame and observer as the search that produced them.
     - If DSM split metadata is available (`dv_lev_km_s`, `eta_lev`) and
       `dv_lev_km_s[k] > 0`, leg `k` is drawn as two propagated arcs split at
       `eta_lev[k]`. Split-arc endpoint velocities are taken from legacy
@@ -1465,6 +1475,31 @@ def plot_trajectory_2d(
         eta_lev = np.asarray(traj_record["eta_lev"], dtype=float).reshape(-1)
         if eta_lev.shape != (num_legs,):
             raise ValueError("eta_lev must have shape (nE-1,).")
+
+    acc_lt_km_s2 = np.zeros(num_legs)
+    if traj_record.get("acc_lt_km_s2") is not None:
+        acc_lt_km_s2 = np.asarray(traj_record["acc_lt_km_s2"], dtype=float)
+        if (acc_lt_km_s2.shape != (num_legs,) or not np.all(np.isfinite(acc_lt_km_s2))
+                or np.any(acc_lt_km_s2 < 0)):
+            raise ValueError("acc_lt_km_s2 must contain one finite nonnegative value per leg.")
+    lt_controls = traj_record.get("lt_control")
+    lt_n_rev = traj_record.get("lt_n_rev")
+    lt_lev_type = np.asarray(traj_record.get("lt_lev_type", np.zeros(num_legs)), dtype=int)
+    if lt_lev_type.shape != (num_legs,):
+        raise ValueError("lt_lev_type must contain one code per leg.")
+    if np.any(acc_lt_km_s2 > 0):
+        if (lt_controls is None or lt_n_rev is None
+                or len(lt_controls) != num_legs or len(lt_n_rev) != num_legs):
+            raise ValueError("Low-thrust plotting requires per-leg lt_control and lt_n_rev; "
+                             "legacy first-order low-thrust records cannot be replayed.")
+        for k in np.flatnonzero(acc_lt_km_s2 > 0):
+            control = np.asarray(lt_controls[k], dtype=float)
+            if (control.shape != (9,) or not np.all(np.isfinite(control))
+                    or lt_n_rev[k] is None or not np.isfinite(lt_n_rev[k])
+                    or int(lt_n_rev[k]) != lt_n_rev[k]):
+                raise ValueError(f"Low-thrust leg {k} requires nine finite control values and an integer revolution count.")
+            if dv_lev_km_s is not None and dv_lev_km_s[k] > 1e-12:
+                raise ValueError(f"Leg {k} cannot combine low thrust and an impulsive DSM.")
 
     has_any_legacy_endpoint_field = any(
         key in traj_record and traj_record[key] is not None
@@ -1589,6 +1624,8 @@ def plot_trajectory_2d(
                 f"dv_lev_km_s={[float(dv_lev_km_s[idx]) for idx in nonzero_dsm_idx]}"
             )
 
+    thrust_arcs = []
+    lt_lines = []
     # Plot each leg from reconstructed state.
     for leg_idx in range(num_legs):
         t0_et_s = float(t_et_s[leg_idx])
@@ -1717,14 +1754,36 @@ def plot_trajectory_2d(
         else:
             v0_km_s = vB0_km_s + np.asarray(vinfD_km_s[leg_idx], dtype=float)
 
-        leg_pos_km = sample_leg(
-            r0_km,
-            v0_km_s,
-            t0_et_s,
-            t1_et_s,
-            float(mu_central),
-            int(num_samples_leg),
-        )
+        if acc_lt_km_s2[leg_idx] > 0:
+            try:
+                states, thrust = propagate_binned_low_thrust(
+                    rB0_km, rB1_km, vB0_km_s, vB1_km_s, vinfD_km_s[leg_idx],
+                    lt_n_rev[leg_idx], dt_total_s, float(mu_central),
+                    acc_lt_km_s2[leg_idx], lt_controls[leg_idx], num_samples=int(num_samples_leg))
+            except (ValueError, RuntimeError, FloatingPointError):
+                plt.close(fig)
+                raise
+            leg_pos_km = states[:, :3]
+            r_end_km, v_end_km_s = states[-1, :3], states[-1, 3:]
+            thrust_arcs.append((leg_pos_km, thrust))
+            model = ("quadratic" if abs(lt_lev_type[leg_idx]) == 2 else
+                     "first-order" if lt_lev_type[leg_idx] != 0 else "binned")
+            velocity_miss = ("" if vinfA_km_s is None else
+                f"\n   velocity miss={np.linalg.norm(v_end_km_s - vB1_km_s - vinfA_km_s[leg_idx]):.3e} km/s")
+            lt_lines.append(
+                f"LT leg {leg_idx + 1} ({model}): a={acc_lt_km_s2[leg_idx] * 1e6:.3f} mm/s²\n"
+                f"   DV={acc_lt_km_s2[leg_idx] * dt_total_s:.4f} km/s; "
+                f"gap={np.linalg.norm(r_end_km - rB1_km):.3e} km{velocity_miss}")
+        else:
+            leg_pos_km = sample_leg(
+                r0_km,
+                v0_km_s,
+                t0_et_s,
+                t1_et_s,
+                float(mu_central),
+                int(num_samples_leg),
+            )
+            r_end_km, v_end_km_s = kepler_propagate_universal(r0_km, v0_km_s, dt_total_s, float(mu_central))
         ax.plot(
             leg_pos_km[:, 0],
             leg_pos_km[:, 1],
@@ -1734,7 +1793,6 @@ def plot_trajectory_2d(
             label=f"SC leg {leg_idx}",
         )
 
-        r_end_km, v_end_km_s = kepler_propagate_universal(r0_km, v0_km_s, dt_total_s, float(mu_central))
         pos_err_km = float(np.linalg.norm(r_end_km - rB1_km))
         if pos_err_km > closure_pos_tol_km:
             warnings.warn(
@@ -1742,7 +1800,9 @@ def plot_trajectory_2d(
                 f"tol={float(closure_pos_tol_km):.3e} km."
             )
 
-        if vf_lev_km_s is not None:
+        if acc_lt_km_s2[leg_idx] > 0 and vinfA_km_s is not None:
+            v_expected_km_s = vB1_km_s + np.asarray(vinfA_km_s[leg_idx], dtype=float)
+        elif vf_lev_km_s is not None:
             v_expected_km_s = np.asarray(vf_lev_km_s[leg_idx], dtype=float)
         elif vinfA_km_s is not None:
             v_expected_km_s = vB1_km_s + np.asarray(vinfA_km_s[leg_idx], dtype=float)
@@ -1800,6 +1860,23 @@ def plot_trajectory_2d(
     ax.set_ylabel(f"y [{frame}] km")
     ax.grid(True, alpha=0.3)
 
+    if thrust_arcs:
+        peak = float(np.max(acc_lt_km_s2))
+        span = max(np.ptp(ax.get_xlim()), np.ptp(ax.get_ylim())) / 2.0
+        # Convert to displayed km before quiver adds vectors to heliocentric positions;
+        # raw km/s² accelerations can disappear through floating-point cancellation.
+        arrow_scale = 0.05 * span / peak
+        for positions, thrust in thrust_arcs:
+            picks = np.linspace(0, len(positions) - 1, min(12, len(positions)), dtype=int)
+            arrows = thrust[picks] * arrow_scale
+            quiver = ax.quiver(
+                positions[picks, 0], positions[picks, 1], arrows[:, 0], arrows[:, 1],
+                angles="xy", scale_units="xy", scale=1, color="#e41a1c",
+                width=0.004, minlength=0, zorder=7)
+        ax.quiverkey(quiver, 0.04, 0.98, peak * arrow_scale, f"{peak * 1e6:.3f} mm/s²",
+                     labelpos="E", coordinates="axes",
+                     labelcolor="white" if dark else "black")
+
     title = f"Trajectory {traj_id}"
     subtitle_parts = []
     if dv_display_km_s is not None:
@@ -1811,6 +1888,8 @@ def plot_trajectory_2d(
     ax.set_title(title)
 
     enc_lines = _build_encounter_legend_lines(traj_record)
+    if lt_lines:
+        enc_lines.extend(["Red arrows: thrust acceleration (x-y)", "", *lt_lines])
     enc_text_artist = fig.text(
         0.64, 0.92,
         "\n".join(enc_lines),

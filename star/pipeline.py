@@ -25,6 +25,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -99,6 +100,9 @@ class StarProblemConfig:
     dvlev_max_km_s: list[float]
     delta_dvlev_km_s: list[float]
     vinf_margin_pre_filter_km_s: list[float]
+    acc_lt_max_km_s2: list[float]
+    delta_acc_lt_km_s2: list[float]
+    isp_lt_s: list[float]
     lev_type: Tuple[str, ...]
     resonant_enabled: list[bool]
     resonant_dvinf_km_s: list[float]
@@ -790,7 +794,27 @@ def _resolve_problem_config(problem_module: object) -> StarProblemConfig:
         10.0,
         "vinf_margin_pre_filter/vinf_margin_pre_filter_km_s",
     )
+    acc_lt_max_km_s2 = _resolve_per_leg_float_setting(
+        _first_defined_attr(problem_module, "acc_lt_max", "acc_lt_max_km_s2"),
+        n_legs,
+        0.0,
+        "acc_lt_max/acc_lt_max_km_s2",
+    )
+    delta_acc_lt_km_s2 = _resolve_per_leg_float_setting(
+        _first_defined_attr(problem_module, "dacc_lt", "delta_acc_lt", "delta_acc_lt_km_s2"),
+        n_legs,
+        0.0,
+        "dacc_lt/delta_acc_lt/delta_acc_lt_km_s2",
+    )
+    isp_lt_s = _resolve_per_leg_float_setting(
+        getattr(problem_module, "isp_lt_s", None),
+        n_legs,
+        0.0,
+        "isp_lt_s",
+    )
     lev_type = _resolve_lev_type(getattr(problem_module, "lev_type", None))
+    if getattr(problem_module, "lt_vinf_bins_km_s", None) is not None:
+        raise ValueError("Shared low-thrust speed bins are not supported; use acc_lt_max and dacc_lt.")
     resonant_enabled = _resolve_per_leg_bool_setting(
         _first_defined_attr(problem_module, "resonant", "resonant_enabled"),
         n_legs,
@@ -862,6 +886,9 @@ def _resolve_problem_config(problem_module: object) -> StarProblemConfig:
         dvlev_max_km_s=dvlev_max_km_s,
         delta_dvlev_km_s=delta_dvlev_km_s,
         vinf_margin_pre_filter_km_s=vinf_margin_pre_filter_km_s,
+        acc_lt_max_km_s2=acc_lt_max_km_s2,
+        delta_acc_lt_km_s2=delta_acc_lt_km_s2,
+        isp_lt_s=isp_lt_s,
         lev_type=lev_type,
         resonant_enabled=resonant_enabled,
         resonant_dvinf_km_s=resonant_dvinf_km_s,
@@ -995,6 +1022,8 @@ def _build_null_leg_append_rows(
             "n_rev": np.zeros(row_count, dtype=np.int64),
             "dv_lev_km_s": np.zeros(row_count, dtype=float),
             "eta_lev": np.zeros(row_count, dtype=float),
+            "acc_lt_km_s2": np.zeros(row_count, dtype=float),
+            "lt_lev_type": np.zeros(row_count, dtype=np.int64),
         },
         np.asarray(source_il, dtype=np.int64),
     )
@@ -1020,6 +1049,12 @@ def _subset_flyby_leg_excluding_il(leg_db: LegDatabase, excluded_il: np.ndarray)
             None if leg_db.dv_lev_km_s is None else np.asarray(leg_db.dv_lev_km_s, dtype=float)[keep_mask]
         ),
         eta_lev=None if leg_db.eta_lev is None else np.asarray(leg_db.eta_lev, dtype=float)[keep_mask],
+        acc_lt_km_s2=(
+            None if leg_db.acc_lt_km_s2 is None else np.asarray(leg_db.acc_lt_km_s2, dtype=float)[keep_mask]
+        ),
+        lt_lev_type=(
+            None if leg_db.lt_lev_type is None else np.asarray(leg_db.lt_lev_type, dtype=np.int64)[keep_mask]
+        ),
     )
 
 
@@ -1127,6 +1162,18 @@ def _build_leg_cfg(problem_cfg: StarProblemConfig, leg_index: int) -> LegBuildCo
 
     dvlev_max = float(problem_cfg.dvlev_max_km_s[leg_index])
     delta_dvlev = float(problem_cfg.delta_dvlev_km_s[leg_index])
+    acc_lt_by_leg = getattr(problem_cfg, "acc_lt_max_km_s2", [0.0] * int(problem_cfg.n_legs))
+    delta_acc_lt_by_leg = getattr(problem_cfg, "delta_acc_lt_km_s2", [0.0] * int(problem_cfg.n_legs))
+    isp_lt_by_leg = getattr(problem_cfg, "isp_lt_s", [0.0] * int(problem_cfg.n_legs))
+    acc_lt_max = float(acc_lt_by_leg[leg_index])
+    delta_acc_lt = float(delta_acc_lt_by_leg[leg_index])
+    isp_lt = float(isp_lt_by_leg[leg_index])
+    if dvlev_max > 0.0 and acc_lt_max > 0.0:
+        raise ValueError(
+            f"Leg {leg_index} cannot enable both impulsive DSM leveraging and low-thrust leveraging."
+        )
+    if acc_lt_max > 0.0 and isp_lt <= 0.0:
+        raise ValueError(f"Leg {leg_index} requires isp_lt_s > 0 when low-thrust leveraging is active.")
 
     return LegBuildConfig(
         leg_stage_id=int(leg_index),
@@ -1145,6 +1192,9 @@ def _build_leg_cfg(problem_cfg: StarProblemConfig, leg_index: int) -> LegBuildCo
         dvlev_max_km_s=dvlev_max,
         delta_dvlev_km_s=delta_dvlev,
         vinf_margin_pre_filter_km_s=float(problem_cfg.vinf_margin_pre_filter_km_s[leg_index]),
+        acc_lt_max_km_s2=acc_lt_max,
+        delta_acc_lt_km_s2=delta_acc_lt,
+        lt_dv_max_km_s=np.inf if problem_cfg.combo_dv_cap_km_s is None else problem_cfg.combo_dv_cap_km_s,
         lev_type=problem_cfg.lev_type,
         resonant_enabled=bool(problem_cfg.resonant_enabled[leg_index]),
         resonant_angle_tol_deg=float(problem_cfg.resonant_angle_tol_deg[leg_index]),
@@ -1195,8 +1245,17 @@ def _build_leg_weights(encounter_db: EncounterDB, problem_cfg: StarProblemConfig
         n_lambert = max(1, 2 * (int(problem_cfg.lambert_nrev[leg_index]) + 1))
         dv_lev = float(problem_cfg.dvlev_max_km_s[leg_index])
         delta_dv = float(problem_cfg.delta_dvlev_km_s[leg_index])
+        acc_lt_by_leg = getattr(problem_cfg, "acc_lt_max_km_s2", [0.0] * int(problem_cfg.n_legs))
+        delta_acc_lt_by_leg = getattr(problem_cfg, "delta_acc_lt_km_s2", [0.0] * int(problem_cfg.n_legs))
+        acc_lt = float(acc_lt_by_leg[leg_index])
+        delta_acc_lt = float(delta_acc_lt_by_leg[leg_index])
         if delta_dv > 0.0 and dv_lev > 0.0:
             leveraging = 1.0 + 5.0 * dv_lev / delta_dv
+        elif delta_acc_lt > 0.0 and acc_lt > 0.0:
+            from star.low_thrust import build_acc_lt_grid_km_s2
+
+            n_acc = int(np.asarray(build_acc_lt_grid_km_s2(acc_lt, delta_acc_lt), dtype=float).size)
+            leveraging = float(max(1, n_acc * len(problem_cfg.lev_type)))
         else:
             leveraging = 1.0
         leg_weights[leg_index] = n_lambert * (tof_window / time_span) * leveraging
@@ -1751,6 +1810,7 @@ def _finalize_output(
         flyby_stage_dirs=flyby_stage_dirs,
         output_path=output_path,
         null_flags=problem_cfg.null_flags,
+        isp_lt_s=getattr(problem_cfg, "isp_lt_s", [0.0] * int(problem_cfg.n_legs)),
     )
     print(f"Saved minimal solution file: {saved_file}")
 
@@ -1765,6 +1825,7 @@ def _cleanup_cache_root(cache_root: Path, *, resume_phase2_only: bool) -> None:
 def main() -> None:
     """Run the full STAR pipeline using the selected problem module."""
 
+    started = perf_counter()
     args = build_arg_parser().parse_args()
     run_paths = _resolve_run_paths(args, root_folder)
     if run_paths.resume_phase2_only:
@@ -1804,6 +1865,8 @@ def main() -> None:
         output_path=run_paths.output_path,
     )
     _cleanup_cache_root(run_paths.cache_root, resume_phase2_only=run_paths.resume_phase2_only)
+    elapsed_s = perf_counter() - started
+    print(f"Total runtime: {elapsed_s:.2f} s ({elapsed_s / 60.0:.2f} min)")
 
 if __name__ == "__main__":
     main()

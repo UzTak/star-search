@@ -50,6 +50,25 @@ def _make_leg_db(
 
 
 class FlybyDatabaseFilterTest(unittest.TestCase):
+    def test_filter_leg_db_keeps_low_thrust_controls_aligned(self) -> None:
+        leg = _make_leg_db(stage_id=0, il=[10, 20, 30], dep_ids=[1, 2, 3],
+                           arr_ids=[4, 5, 6], vinf_dep=[[1, 0, 0]] * 3,
+                           vinf_arr=[[0, 1, 0]] * 3)
+        leg.acc_lt_km_s2 = np.array([1e-8, 2e-8, 3e-8])
+        leg.lt_lev_type = np.array([2, -2, 2])
+        controls = np.arange(27, dtype=float).reshape(3, 9)
+        leg.lt_control = controls.copy()
+
+        self.assertEqual(flyby_database._filter_leg_db_by_il(leg, np.array([30, 10])), 1)
+        np.testing.assert_array_equal(leg.IL, [10, 30])
+        np.testing.assert_array_equal(leg.ID, [1, 3])
+        np.testing.assert_array_equal(leg.acc_lt_km_s2, [1e-8, 3e-8])
+        np.testing.assert_array_equal(leg.lt_lev_type, [2, 2])
+        np.testing.assert_array_equal(leg.lt_control, controls[[0, 2]])
+
+        self.assertEqual(flyby_database._filter_leg_db_by_il(leg, np.array([], dtype=int)), 2)
+        self.assertEqual(leg.lt_control.shape, (0, 9))
+
     def _make_entry(self, *, ie: int, stage_id: int, body: int) -> EncounterEntry:
         return EncounterEntry(
             IE=int(ie),

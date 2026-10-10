@@ -726,6 +726,10 @@ def _filter_leg_db_by_il(leg_db: LegDatabase, keep_il: np.ndarray) -> int:
     leg_db.n_rev = leg_db.n_rev[mask]
     leg_db.dv_lev_km_s = leg_db.dv_lev_km_s[mask]
     leg_db.eta_lev = leg_db.eta_lev[mask]
+    leg_db.acc_lt_km_s2 = leg_db.acc_lt_km_s2[mask]
+    leg_db.lt_lev_type = leg_db.lt_lev_type[mask]
+    if leg_db.lt_control is not None:
+        leg_db.lt_control = leg_db.lt_control[mask]
 
     after = int(leg_db.IL.size)
     return before - after
@@ -1614,6 +1618,10 @@ if __name__ == "__main__":
     vinf_margin_pre_filter_raw = getattr(example, "vinf_margin_pre_filter", None)
     if vinf_margin_pre_filter_raw is None:
         vinf_margin_pre_filter_raw = getattr(example, "vinf_margin_pre_filter_km_s", 10.0)
+    acc_lt_max_raw = getattr(example, "acc_lt_max", [0.0] * n_legs)
+    delta_acc_lt_raw = getattr(example, "dacc_lt", None)
+    if delta_acc_lt_raw is None:
+        delta_acc_lt_raw = getattr(example, "delta_acc_lt", [0.0] * n_legs)
     lev_type_raw = getattr(example, "lev_type", ["+-", "-+"])
 
     if np.isscalar(nrev_raw):
@@ -1651,6 +1659,20 @@ if __name__ == "__main__":
     if len(vinf_margin_pre_filter_by_leg) < n_legs:
         raise ValueError(f"Need at least {n_legs} vinf_margin_pre_filter entries.")
 
+    if np.isscalar(acc_lt_max_raw):
+        acc_lt_max_by_leg = [float(acc_lt_max_raw)] * n_legs
+    else:
+        acc_lt_max_by_leg = [float(v) for v in list(acc_lt_max_raw)]
+    if len(acc_lt_max_by_leg) < n_legs:
+        raise ValueError(f"Need at least {n_legs} acc_lt_max entries.")
+
+    if np.isscalar(delta_acc_lt_raw):
+        delta_acc_lt_by_leg = [float(delta_acc_lt_raw)] * n_legs
+    else:
+        delta_acc_lt_by_leg = [float(v) for v in list(delta_acc_lt_raw)]
+    if len(delta_acc_lt_by_leg) < n_legs:
+        raise ValueError(f"Need at least {n_legs} dacc_lt entries.")
+
     if isinstance(lev_type_raw, str):
         lev_type = (lev_type_raw,)
     else:
@@ -1683,6 +1705,8 @@ if __name__ == "__main__":
             dvlev_max_km_s=float(dvlev_max_by_leg[leg_index]),
             delta_dvlev_km_s=float(delta_dvlev_by_leg[leg_index]),
             vinf_margin_pre_filter_km_s=float(vinf_margin_pre_filter_by_leg[leg_index]),
+            acc_lt_max_km_s2=float(acc_lt_max_by_leg[leg_index]),
+            delta_acc_lt_km_s2=float(delta_acc_lt_by_leg[leg_index]),
             lev_type=lev_type,
             parallelism=None,
             dt_positive_tol_s=1e-6,

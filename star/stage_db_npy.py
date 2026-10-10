@@ -1,9 +1,9 @@
 """Simple stage-wise NPY storage for disk-backed Phase-1.
 
-Each stage lives in its own directory holding one `<column>.npy` file per
-column plus a `meta.json` recording `kind`, `stage_id`, and `row_count`.
-Columns are addressed by name, never by position, so the set of columns can
-change without invalidating previously written stage directories.
+Each stage lives in its own directory holding one ``<column>.npy`` file per
+column plus a ``meta.json`` recording ``kind``, ``stage_id``, and ``row_count``.
+Columns are addressed by name, never by position. Missing low-thrust columns
+in legacy ballistic caches are read as zero-valued metadata.
 
 See NOTATION.md for the meaning of the stored columns.
 """
@@ -31,6 +31,8 @@ _LEG_COLUMNS = (
     "n_rev",
     "dv_lev_km_s",
     "eta_lev",
+    "acc_lt_km_s2",
+    "lt_lev_type",
 )
 
 _FLYBY_COLUMNS = (
@@ -58,6 +60,8 @@ _LEG_COLUMN_DTYPES = {
     "n_rev": np.dtype(np.int64),
     "dv_lev_km_s": np.dtype(float),
     "eta_lev": np.dtype(float),
+    "acc_lt_km_s2": np.dtype(float),
+    "lt_lev_type": np.dtype(np.int64),
 }
 
 
@@ -124,11 +128,18 @@ def save_leg_stage(stage_dir: str | Path, leg_db: LegDatabase) -> Path:
         "n_rev": np.asarray(leg_db.n_rev, dtype=np.int64).reshape(-1),
         "dv_lev_km_s": np.asarray(leg_db.dv_lev_km_s, dtype=float).reshape(-1),
         "eta_lev": np.asarray(leg_db.eta_lev, dtype=float).reshape(-1),
+        "acc_lt_km_s2": np.asarray(leg_db.acc_lt_km_s2, dtype=float).reshape(-1),
+        "lt_lev_type": np.asarray(leg_db.lt_lev_type, dtype=np.int64).reshape(-1),
     }
     for name, arr in columns.items():
         if int(arr.shape[0]) != row_count:
             raise ValueError(f"Leg column '{name}' has mismatched row count.")
         np.save(stage_path / f"{name}.npy", arr, allow_pickle=False)
+
+    if leg_db.lt_control is not None:
+        np.save(stage_path / "lt_control.npy", leg_db.lt_control, allow_pickle=False)
+    else:
+        (stage_path / "lt_control.npy").unlink(missing_ok=True)
 
     np.save(stage_path / "active_mask.npy", np.ones(row_count, dtype=bool), allow_pickle=False)
     _write_meta(stage_path, kind="leg", stage_id=int(leg_db.stage_id), row_count=row_count)
@@ -259,8 +270,17 @@ def _load_column(stage_dir: str | Path, column_name: str, *, active_only: bool) 
 def load_leg_column(stage_dir: str | Path, column_name: str, active_only: bool = False) -> np.ndarray:
     if column_name not in _LEG_COLUMNS:
         raise ValueError(f"Unknown leg column: {column_name}")
-    array = _load_column(stage_dir, column_name, active_only=active_only)
-    if column_name in {"IL", "ID", "IA", "n_rev"}:
+    stage_path = Path(stage_dir)
+    column_path = stage_path / f"{column_name}.npy"
+    if not column_path.exists() and column_name in {"acc_lt_km_s2", "lt_lev_type"}:
+        row_count = int(_read_meta(stage_path).get("row_count", 0))
+        dtype = np.int64 if column_name == "lt_lev_type" else float
+        array = np.zeros(row_count, dtype=dtype)
+        if active_only:
+            array = array[load_active_mask(stage_path)]
+    else:
+        array = _load_column(stage_path, column_name, active_only=active_only)
+    if column_name in {"IL", "ID", "IA", "n_rev", "lt_lev_type"}:
         return np.asarray(array, dtype=np.int64).reshape(-1)
     if column_name in {"vinfD_km_s", "vinfA_km_s"}:
         return np.asarray(array, dtype=float).reshape(-1, 3)
@@ -292,6 +312,10 @@ def load_leg_stage(stage_dir: str | Path, active_only: bool = False) -> LegDatab
         n_rev=load_leg_column(stage_path, "n_rev", active_only=active_only),
         dv_lev_km_s=load_leg_column(stage_path, "dv_lev_km_s", active_only=active_only),
         eta_lev=load_leg_column(stage_path, "eta_lev", active_only=active_only),
+        acc_lt_km_s2=load_leg_column(stage_path, "acc_lt_km_s2", active_only=active_only),
+        lt_lev_type=load_leg_column(stage_path, "lt_lev_type", active_only=active_only),
+        lt_control=(_load_column(stage_path, "lt_control", active_only=active_only)
+                    if (stage_path / "lt_control.npy").exists() else None),
     )
 
 
@@ -314,6 +338,8 @@ def load_leg_stage_for_flyby(stage_dir: str | Path, active_only: bool = False) -
         n_rev=load_leg_column(stage_path, "n_rev", active_only=active_only),
         dv_lev_km_s=load_leg_column(stage_path, "dv_lev_km_s", active_only=active_only),
         eta_lev=load_leg_column(stage_path, "eta_lev", active_only=active_only),
+        acc_lt_km_s2=load_leg_column(stage_path, "acc_lt_km_s2", active_only=active_only),
+        lt_lev_type=load_leg_column(stage_path, "lt_lev_type", active_only=active_only),
     )
 
 
@@ -356,6 +382,7 @@ class LegStageNpyWriter:
 
         self._part_count = 0
         self._row_count = 0
+        self._has_lt_control = False
 
     @property
     def row_count(self) -> int:
@@ -374,6 +401,9 @@ class LegStageNpyWriter:
         n_rev: np.ndarray,
         dv_lev_km_s: np.ndarray,
         eta_lev: np.ndarray,
+        acc_lt_km_s2: Optional[np.ndarray] = None,
+        lt_lev_type: Optional[np.ndarray] = None,
+        lt_control: Optional[np.ndarray] = None,
     ) -> int:
         id_array = np.asarray(id, dtype=np.int64).reshape(-1)
         ia_array = np.asarray(ia, dtype=np.int64).reshape(-1)
@@ -383,6 +413,20 @@ class LegStageNpyWriter:
         dv_array = np.asarray(dv_lev_km_s, dtype=float).reshape(-1)
         eta_array = np.asarray(eta_lev, dtype=float).reshape(-1)
         row_count = int(id_array.size)
+        if lt_control is not None:
+            lt_control = np.asarray(lt_control, dtype=float)
+            if lt_control.shape != (row_count, 9):
+                raise ValueError("lt_control must have shape (N,9).")
+        acc_array = (
+            np.zeros(row_count, dtype=float)
+            if acc_lt_km_s2 is None
+            else np.asarray(acc_lt_km_s2, dtype=float).reshape(-1)
+        )
+        lt_type_array = (
+            np.zeros(row_count, dtype=np.int64)
+            if lt_lev_type is None
+            else np.asarray(lt_lev_type, dtype=np.int64).reshape(-1)
+        )
        
         if (
             int(ia_array.size) != row_count
@@ -391,6 +435,8 @@ class LegStageNpyWriter:
             or int(nrev_array.size) != row_count
             or int(dv_array.size) != row_count
             or int(eta_array.size) != row_count
+            or int(acc_array.size) != row_count
+            or int(lt_type_array.size) != row_count
         ):
             raise ValueError("append_rows inputs must have the same row count.")
         if row_count == 0:
@@ -408,6 +454,11 @@ class LegStageNpyWriter:
         np.save(self._part_path("n_rev", part_index), nrev_array, allow_pickle=False)
         np.save(self._part_path("dv_lev_km_s", part_index), dv_array, allow_pickle=False)
         np.save(self._part_path("eta_lev", part_index), eta_array, allow_pickle=False)
+        np.save(self._part_path("acc_lt_km_s2", part_index), acc_array, allow_pickle=False)
+        np.save(self._part_path("lt_lev_type", part_index), lt_type_array, allow_pickle=False)
+        if lt_control is not None:
+            np.save(self._part_path("lt_control", part_index), lt_control, allow_pickle=False)
+            self._has_lt_control = True
 
         self._part_count += 1
         self._row_count += row_count
@@ -415,19 +466,23 @@ class LegStageNpyWriter:
 
     def _finalize_column(self, column_name: str) -> None:
         out_path = self._tmp_dir / f"{column_name}.npy"
-        dtype = _LEG_COLUMN_DTYPES[column_name]
+        dtype = _LEG_COLUMN_DTYPES.get(column_name, np.dtype(float))
         total_rows = int(self._row_count)
         if total_rows == 0:
             empty_shape = (0, 3) if column_name in {"vinfD_km_s", "vinfA_km_s"} else (0,)
             np.save(out_path, np.empty(empty_shape, dtype=dtype), allow_pickle=False)
             return
 
-        shape = (total_rows, 3) if column_name in {"vinfD_km_s", "vinfA_km_s"} else (total_rows,)
+        shape = ((total_rows, 9) if column_name == "lt_control" else
+                 (total_rows, 3) if column_name in {"vinfD_km_s", "vinfA_km_s"} else (total_rows,))
         out_mem = open_memmap(out_path, mode="w+", dtype=dtype, shape=shape)
         cursor = 0
         for part_index in range(int(self._part_count)):
             part_path = self._part_path(column_name, part_index)
-            if len(shape) > 1:
+            if column_name == "lt_control" and not part_path.exists():
+                n_part = np.load(self._part_path("ID", part_index), mmap_mode="r").size
+                part_data = np.full((n_part, 9), np.nan)
+            elif len(shape) > 1:
                 part_data = np.asarray(np.load(part_path, allow_pickle=False), dtype=dtype).reshape(-1, shape[1])
             else:
                 part_data = np.asarray(np.load(part_path, allow_pickle=False), dtype=dtype).reshape(-1)
@@ -442,6 +497,8 @@ class LegStageNpyWriter:
     def finalize(self) -> int:
         for column_name in _LEG_COLUMNS:
             self._finalize_column(column_name)
+        if self._has_lt_control:
+            self._finalize_column("lt_control")
         shutil.rmtree(self._parts_dir, ignore_errors=True)
         np.save(self._tmp_dir / "active_mask.npy", np.ones(self._row_count, dtype=bool), allow_pickle=False)
         _write_meta(self._tmp_dir, kind="leg", stage_id=int(self._stage_id), row_count=int(self._row_count))

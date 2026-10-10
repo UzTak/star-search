@@ -9,6 +9,9 @@ Implemented scope:
 Not implemented here:
 - VILT/central-body switching/nonconsecutive legs
 
+See NOTATION.md for the full glossary, including the tfilter/null-leg
+vocabulary used throughout this module.
+
 Index glossary
 --------------
 IE  : Encounter index — a row index into EncounterDB.entries (global, unique per node).
@@ -18,9 +21,6 @@ IT  : Triplet index   — a row index into a TripletDB.
 IS  : Segment index   — a row index into a SegmentDB.
 tof : Time of flight  — elapsed duration between two consecutive encounters [seconds].
 dv  : Delta-v         — impulsive velocity change [km/s].
-
-See NOTATION.md for the full glossary, including the tfilter/null-leg
-vocabulary used throughout this module.
 """
 
 from __future__ import annotations
@@ -51,7 +51,8 @@ class ComboBuildConfig:
     """Configuration for Chapter 5.1-5.3 combo construction.
 
     Attributes:
-        dv_total_max_km_s: Optional upper bound on segment/trajectory total DV [km/s].
+        dv_total_max_km_s: Optional upper bound on DSM, flyby patch, and equivalent
+            low-thrust DV summed over the segment/trajectory [km/s].
         tof_total_bounds_s: Optional `(min_s, max_s)` on total time of flight [seconds].
         max_rows_per_segment_db: Optional per-step cap on kept rows.
         debug: Enable internal assertions.
@@ -930,6 +931,9 @@ def _collapse_null_trajectory_record(
     vinfA_km_s: np.ndarray,
     dv_lev_km_s: np.ndarray,
     eta_lev: np.ndarray,
+    acc_lt_km_s2: np.ndarray,
+    isp_lt_s: np.ndarray,
+    lt_lev_type: np.ndarray,
     dv_patch_km_s: np.ndarray,
     leg_ils: np.ndarray,
     flyby_ifs: np.ndarray,
@@ -948,6 +952,9 @@ def _collapse_null_trajectory_record(
     vinfa_list = [np.asarray(value, dtype=float) for value in np.asarray(vinfA_km_s, dtype=float)]
     dv_lev_list = [float(value) for value in np.asarray(dv_lev_km_s, dtype=float)]
     eta_list = [float(value) for value in np.asarray(eta_lev, dtype=float)]
+    acc_lt_list = [float(value) for value in np.asarray(acc_lt_km_s2, dtype=float)]
+    isp_lt_list = [float(value) for value in np.asarray(isp_lt_s, dtype=float)]
+    lt_type_list = [int(value) for value in np.asarray(lt_lev_type, dtype=np.int64)]
     dv_patch_list = [float(value) for value in np.asarray(dv_patch_km_s, dtype=float)]
     leg_il_list = [int(value) for value in np.asarray(leg_ils, dtype=np.int64)]
     flyby_if_list = [int(value) for value in np.asarray(flyby_ifs, dtype=np.int64)]
@@ -986,6 +993,9 @@ def _collapse_null_trajectory_record(
         vinfa_list.pop(leg_index)
         dv_lev_list.pop(leg_index)
         eta_list.pop(leg_index)
+        acc_lt_list.pop(leg_index)
+        isp_lt_list.pop(leg_index)
+        lt_type_list.pop(leg_index)
         leg_il_list.pop(leg_index)
         null_list.pop(leg_index)
         if drop_flyby_idx is not None and 0 <= int(drop_flyby_idx) < len(flyby_if_list):
@@ -1000,6 +1010,9 @@ def _collapse_null_trajectory_record(
         "vinfA_km_s": np.asarray(vinfa_list, dtype=float).reshape(-1, 3),
         "dv_lev_km_s": np.asarray(dv_lev_list, dtype=float),
         "eta_lev": np.asarray(eta_list, dtype=float),
+        "acc_lt_km_s2": np.asarray(acc_lt_list, dtype=float),
+        "isp_lt_s": np.asarray(isp_lt_list, dtype=float),
+        "lt_lev_type": np.asarray(lt_type_list, dtype=np.int64),
         "dv_patch_km_s": np.asarray(dv_patch_list, dtype=float),
         "leg_ils": np.asarray(leg_il_list, dtype=np.int64),
         "flyby_ifs": np.asarray(flyby_if_list, dtype=np.int64),
@@ -1015,6 +1028,7 @@ def save_solution(
     *,
     flyby_stage_dirs: Optional[Mapping[int, str | Path]] = None,
     null_flags: Optional[Sequence[bool]] = None,
+    isp_lt_s: Optional[Sequence[float]] = None,
 ) -> Path:
     """Save minimal solution rows for trajectory reconstruction.
 
@@ -1025,6 +1039,12 @@ def save_solution(
     - `vinfA_km_s`: per-leg arrival excess vectors [km/s], shape (n_legs, 3)
     - `dv_lev_km_s`: per-leg DSM leveraging magnitude [km/s], shape (n_legs,)
     - `eta_lev`: per-leg DSM split fraction eta [0..1], shape (n_legs,)
+    - `acc_lt_km_s2`: per-leg low-thrust acceleration tag [km/s^2], shape (n_legs,)
+    - `dv_lt_eq_km_s`: per-leg integrated low-thrust acceleration [km/s]
+    - `isp_lt_s`: per-leg low-thrust specific impulse tag [s], shape (n_legs,)
+    - `lt_lev_type`: signed steering code; +/-2 quadratic, +/-1 legacy linear, 0 binned/untagged.
+    - `mass_ratio_leg`: per-leg low-thrust mass ratio estimate [-], shape (n_legs,)
+    - `mass_ratio_total`: total low-thrust mass ratio estimate [-]
     - `dv_escape_km_s`: departure boundary DV from first encounter [km/s]
     - `dv_insertion_km_s`: arrival boundary DV at last encounter [km/s]
     - `dv_patch_km_s`: per-flyby patch DV [km/s], shape (n_legs-1,)
@@ -1051,6 +1071,9 @@ def save_solution(
     resolved_null_flags = [False] * n_legs if null_flags is None else [bool(flag) for flag in list(null_flags)]
     if len(resolved_null_flags) != n_legs:
         raise ValueError("null_flags length must match output_db leg count.")
+    resolved_isp_lt_s = np.zeros(n_legs, dtype=float) if isp_lt_s is None else np.asarray(isp_lt_s, dtype=float).reshape(-1)
+    if int(resolved_isp_lt_s.size) != n_legs:
+        raise ValueError("isp_lt_s length must match output_db leg count.")
     leg_row_by_il = _build_leg_row_by_il_maps(leg_dbs)
     if n_legs > 1 and flyby_dbs is None and flyby_stage_dirs is None:
         raise ValueError("flyby_dbs or flyby_stage_dirs must be provided for multi-leg solution saving.")
@@ -1071,6 +1094,10 @@ def save_solution(
             vinfA_km_s = np.empty((n_legs, 3), dtype=float)
             dv_lev_km_s = np.empty(n_legs, dtype=float)
             eta_lev = np.empty(n_legs, dtype=float)
+            acc_lt_km_s2 = np.empty(n_legs, dtype=float)
+            lt_lev_type = np.empty(n_legs, dtype=np.int64)
+            lt_controls = []
+            lt_nrev = []
 
             for leg_stage in range(n_legs):
                 leg_il = int(leg_ils[leg_stage])
@@ -1078,7 +1105,12 @@ def save_solution(
                 if leg_row < 0:
                     raise ValueError(f"Missing IL={leg_il} in leg stage {leg_stage}.")
                 leg_db = leg_dbs[int(leg_stage)]
+                control = None if leg_db.lt_control is None else leg_db.lt_control[leg_row]
+                lt_controls.append(None if control is None or not np.all(np.isfinite(control)) else control.tolist())
+                lt_nrev.append(None if lt_controls[-1] is None else int(leg_db.n_rev[leg_row]))
                 dv_lev_km_s[leg_stage] = float(leg_db.dv_lev_km_s[leg_row])
+                acc_lt_km_s2[leg_stage] = float(leg_db.acc_lt_km_s2[leg_row])
+                lt_lev_type[leg_stage] = int(leg_db.lt_lev_type[leg_row])
 
                 have_vinf = (
                     np.asarray(leg_db.vinfD_km_s).ndim == 2
@@ -1125,19 +1157,36 @@ def save_solution(
                 vinfA_km_s=vinfA_km_s,
                 dv_lev_km_s=dv_lev_km_s,
                 eta_lev=eta_lev,
+                acc_lt_km_s2=acc_lt_km_s2,
+                isp_lt_s=resolved_isp_lt_s,
+                lt_lev_type=lt_lev_type,
                 dv_patch_km_s=dv_patch_km_s,
                 leg_ils=leg_ils,
                 flyby_ifs=flyby_ifs,
                 null_flags=resolved_null_flags,
             )
             collapsed_times_et_s = np.asarray(collapsed["times_et_s"], dtype=float)
-
-            # Null-leg collapse drops one encounter and one per-leg entry together,
-            # so the epoch and per-leg arrays must stay consistent afterwards.
+            collapsed_acc_lt_km_s2 = np.asarray(collapsed["acc_lt_km_s2"], dtype=float)
+            collapsed_isp_lt_s = np.asarray(collapsed["isp_lt_s"], dtype=float)
             leg_tof_s = np.diff(collapsed_times_et_s)
+            if int(leg_tof_s.size) != int(collapsed_acc_lt_km_s2.size):
+                raise ValueError("Collapsed low-thrust TOF and acceleration arrays must share row count.")
             collapsed_dv_lev_km_s = np.asarray(collapsed["dv_lev_km_s"], dtype=float)
             if int(leg_tof_s.size) != int(collapsed_dv_lev_km_s.size):
                 raise ValueError("Collapsed trajectory epochs and per-leg arrays must share row count.")
+            mass_ratio_leg = np.ones(int(collapsed_acc_lt_km_s2.size), dtype=float)
+            # Full-duration constant acceleration: integral |a_LT| dt = a_LT * TOF.
+            dv_lt_eq_km_s = collapsed_acc_lt_km_s2 * leg_tof_s
+            active_lt = collapsed_acc_lt_km_s2 > 0.0
+            if np.any(active_lt):
+                isp_active = collapsed_isp_lt_s[active_lt]
+                if np.any(~np.isfinite(isp_active)) or np.any(isp_active <= 0.0):
+                    raise ValueError("isp_lt_s must be finite and > 0 for low-thrust solution export.")
+                g0_km_s2 = 9.80665e-3
+                mass_ratio_leg[active_lt] = np.exp(
+                    -dv_lt_eq_km_s[active_lt] / (isp_active * g0_km_s2)
+                )
+            mass_ratio_total = float(np.prod(mass_ratio_leg, dtype=float)) if int(mass_ratio_leg.size) > 0 else 1.0
 
             record = {
                 "traj_id": int(output_db.I_traj[row]),
@@ -1147,12 +1196,30 @@ def save_solution(
                 "vinfA_km_s": np.asarray(collapsed["vinfA_km_s"], dtype=float).tolist(),
                 "dv_lev_km_s": [float(value) for value in np.asarray(collapsed["dv_lev_km_s"], dtype=float)],
                 "eta_lev": [float(value) for value in np.asarray(collapsed["eta_lev"], dtype=float)],
+                "acc_lt_km_s2": [float(value) for value in collapsed_acc_lt_km_s2],
+                "dv_lt_eq_km_s": dv_lt_eq_km_s.tolist(),
+                "dv_lt_eq_total_km_s": float(np.sum(dv_lt_eq_km_s)),
+                "dv_impulsive_total_km_s": float(
+                    np.sum(collapsed_dv_lev_km_s) + np.sum(collapsed["dv_patch_km_s"])
+                ),
+                "isp_lt_s": [float(value) for value in collapsed_isp_lt_s],
+                "lt_lev_type": [int(value) for value in np.asarray(collapsed["lt_lev_type"], dtype=np.int64)],
+                "mass_ratio_leg": [float(value) for value in mass_ratio_leg],
+                "mass_ratio_total": float(mass_ratio_total),
                 "dv_patch_km_s": np.asarray(collapsed["dv_patch_km_s"], dtype=float).tolist(),
                 "leg_ils": [int(value) for value in np.asarray(collapsed["leg_ils"], dtype=np.int64)],
                 "flyby_ifs": [int(value) for value in np.asarray(collapsed["flyby_ifs"], dtype=np.int64)],
                 "dv_total_km_s": float(output_db.dv_total_km_s[row]),
                 "tof_total_days": float(output_db.tof_total_s[row] / 86400.0),
             }
+            if any(control is not None for control in lt_controls):
+                keep = [stage for stage in range(n_legs) if not (
+                    resolved_null_flags[stage]
+                    and output_db.body_ids[row, stage] == output_db.body_ids[row, stage + 1]
+                    and np.isclose(output_db.times_et_s[row, stage], output_db.times_et_s[row, stage + 1],
+                                   rtol=0, atol=1e-6))]
+                record["lt_control"] = [lt_controls[stage] for stage in keep]
+                record["lt_n_rev"] = [lt_nrev[stage] for stage in keep]
             # TODO: optionally evaluate/store resonant targeting-closure DV here
             # without feeding it back into the coarse-search cost.
 
@@ -1720,9 +1787,17 @@ def run_combo(
             raise ValueError(f"Missing leg stage directory for stage {stage_int}.")
         leg_stage = _load_leg_stage_for_combo(stage_dir, stage_id=stage_int)
         stage_cache[stage_int] = leg_stage
+        from star.stage_db_npy import load_leg_column
+
+        acc_lt = load_leg_column(stage_dir, "acc_lt_km_s2", active_only=True)
+        if acc_lt.shape != leg_stage.IL.shape or np.any(~np.isfinite(acc_lt)) or np.any(acc_lt < 0.0):
+            raise ValueError("Low-thrust acceleration must match leg rows and be finite and >= 0.")
+        # Same scalar leg cost as Cislunar_Star; derive it from existing columns.
+        leg_tof_s = enc_time_lut[leg_stage.IA] - enc_time_lut[leg_stage.ID]
+        leg_search_dv = leg_stage.dv_lev_km_s + acc_lt * leg_tof_s
         dv_by_il_cache[stage_int] = {
             int(leg_il): float(dv)
-            for leg_il, dv in zip(np.asarray(leg_stage.IL, dtype=np.int64), np.asarray(leg_stage.dv_lev_km_s, dtype=float))
+            for leg_il, dv in zip(np.asarray(leg_stage.IL, dtype=np.int64), leg_search_dv)
         }
         dep_ie_by_il_cache[stage_int] = {
             int(leg_il): int(dep_ie)
@@ -1743,9 +1818,6 @@ def run_combo(
             dep_ie_by_il_cache.pop(int(stage_id), None)
             arr_ie_by_il_cache.pop(int(stage_id), None)
 
-    # Keep stage 0 loaded for the full fold.
-    _ensure_leg_stage_loaded(0)
-
     required_triplet_stages = list(range(1, num_legs_total))
     stage_dirs = {int(stage_id): Path(stage_dir) for stage_id, stage_dir in dict(flyby_stage_dirs).items()}
     for triplet_stage in required_triplet_stages:
@@ -1758,6 +1830,9 @@ def run_combo(
         enc_time_lut.fill(np.nan)
         for entry in enc_db.entries:
             enc_time_lut[int(entry.IE)] = float(entry.t_et)
+
+    # Keep stage 0 loaded for the full fold, after its TOF lookup is available.
+    _ensure_leg_stage_loaded(0)
 
     preemptive_dt_by_encounter_s: Optional[np.ndarray] = None
     if cfg.dt_filter_preemptive_s is not None:

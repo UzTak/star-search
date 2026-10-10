@@ -79,6 +79,38 @@ uv run python plotter.py --problem earth_to_jupiter
 
 The plotter exposes several command-line options; see `star-plot --help` for details.
 
+### Low-thrust leveraging
+
+Inspired by Landau et al.'s [*Low Thrust Trajectory Design Techniques for
+Enceladus Lander*](https://www.jpl.nasa.gov/site/research/media/posters/2019/R19221p.pdf),
+we treat continuous thrust as a perturbation of each Lambert conic. The poster
+uses a linearized response; here, first-order primer steering is paired with
+quadratic departure and arrival velocity estimates:
+
+$$
+\mathbf v_{\infty,k}(a) \approx \mathbf v_{\infty,k}^{(0)}
++ a\,\mathbf s_{1,k} + \tfrac12 a^2\,\mathbf s_{2,k}, \qquad k\in\{D,A\}.
+$$
+
+Here $a$ is the sampled constant acceleration, and $\mathbf s_{1,k}$ and
+$\mathbf s_{2,k}$ are its first and second velocity sensitivities. Compute them
+once per reference arc and steering choice, then reuse them across the
+acceleration grid. Each leg contributes its integrated thrust to the existing
+mission budget alongside flyby patches:
+
+$$
+\Delta v_{\mathrm{LT}} = a\,T.
+$$
+
+Endpoints remain approximate; the plotter replays selected legs and reports
+their errors. See [earth_to_jupiter_lt.py](example/earth_to_jupiter_lt.py) for a
+small problem and [bepicolombo_lt.py](example/bepicolombo_lt.py) for a larger one.
+Both show the per-leg acceleration grid and specific impulse settings.
+
+```powershell
+uv run python star.py --problem earth_to_jupiter_lt --metakernel "star/METAKERN.tm"
+```
+
 ## Reference runtimes
 
 Rough sense of scale for the bundled problems.
@@ -90,10 +122,25 @@ Windows 11, Python 3.11, one run each with a warm Numba cache. The first run on 
 | `test1_DVEGA` | 4,710 | 8.8 M | 0.07 M | 5,952 | ~74 s |
 | `test2_EMEJ` | 6,227 | 0.3 M | - | 33 | ~12 s |
 | `earth_to_jupiter` | 3,740 | 6.9 M | 11.5 M | 408 | ~104 s |
+| `earth_to_jupiter_lt` | 12 | 45 | 39 | 9 | 1.52 s |
 | `earth_to_saturn` | 27,330 | 15.3 M | 36.8 M | 459 | ~14 min |
 | `earth_to_uranus` | 949 | 38 K | 0.4 M | 752 | ~20 s |
 | `jovian_petal` | 14,008 | 52.6 M | 735.1 M | 114,702 | ~3 h 45 min |
 | `bepicolombo` | 23,720 | 14.0 M | 102.6 M | 941,219 | ~40 min |
+| `bepicolombo_lt` | 26,413 | 4.5 M | 82.9 M | 121,943 | 33.68 min |
+
+The LT rows were measured locally on 2026-10-09 with Python 3.11.11,
+NumPy 2.4.2, and Numba 0.64.0, using the existing Numba cache. Database sizes
+are the largest counts reported during construction, before subsequent filtering.
+The LT examples use one worker (`earth_to_jupiter_lt`) and seven workers
+(`bepicolombo_lt`). Earth-to-Jupiter LT is a narrow-window smoke case with only
+three epochs per encounter stage, not a mission-wide search. Timings use the
+pipeline's `Total runtime`, including database construction, stitching, filtering,
+export, and cache cleanup; Python startup and imports are excluded.
+
+The `bepicolombo_lt` save limit kept the 50,000 lowest-DV solutions from
+121,943 trajectories after filtering. Logs for both LT runs are saved locally as
+`output/<problem>_reference.log` (git-ignored).
 
 The two levers that matter most are the per-encounter grid step `dt` and the DSM
 leveraging grid (`dvlev_max` / `delta_dvlev`); both multiply the leg-database row

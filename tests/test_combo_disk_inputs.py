@@ -20,6 +20,30 @@ from star.stage_db_npy import save_flyby_stage, save_leg_stage
 
 
 class RunComboDiskFlybyStageTest(unittest.TestCase):
+    def test_low_thrust_cost_accumulates_once(self) -> None:
+        encounter_db, legs = self._build_encounter_db(), self._build_leg_dbs()
+        for leg in legs.values():
+            leg.dv_lev_km_s[:] = 0.0
+            leg.acc_lt_km_s2[:] = 0.01
+        flyby = FlybyDB(IF=np.array([100]), stage_id=np.array([1]), IE=np.array([1]),
+                        IL_in=np.array([10]), IL_out=np.array([20]), dv_km_s=np.array([0.4]))
+        with tempfile.TemporaryDirectory() as directory:
+            leg_dirs = {stage: Path(directory) / f"leg_{stage}" for stage in legs}
+            for stage, leg in legs.items():
+                save_leg_stage(leg_dirs[stage], leg)
+            flyby_dir = Path(directory) / "flyby_1"
+            save_flyby_stage(flyby_dir, flyby)
+            for cap, count in ((0.51, 0), (0.53, 1)):
+                with self.subTest(cap=cap):
+                    result = combo.run_combo(
+                        encounter_db, cfg=combo.ComboBuildConfig(nL=2, dv_total_max_km_s=cap),
+                        leg_stage_dirs=leg_dirs, flyby_stage_dirs={1: flyby_dir},
+                    )
+                    self.assertEqual(result.I_traj.size, count)
+                    if count:
+                        # a * (5 + 7) seconds plus the existing 0.4 km/s flyby cost.
+                        np.testing.assert_allclose(result.dv_total_km_s, [0.52])
+
     def _build_encounter_db(self) -> EncounterDB:
         entries = [
             EncounterEntry(

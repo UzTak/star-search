@@ -105,6 +105,11 @@ class LegBuildConfig:
     vinf_margin_pre_filter_km_s: float = 10.0
     # Leveraging type selector for solve_arc objective type 1.
     lev_type: Tuple[str, ...] = ("+-", "-+")
+    # Low-thrust leveraging controls [km/s^2]: if max <= 0, do not expand low-thrust rows.
+    acc_lt_max_km_s2: float = 0.0
+    delta_acc_lt_km_s2: float = 0.0
+    # Existing mission DV cap, used to skip individually unaffordable LT samples.
+    lt_dv_max_km_s: float = np.inf
     # Optional resonant-leg expansion off near-resonant Lambert seeds.
     resonant_enabled: bool = False
     resonant_angle_tol_deg: float = 4.0
@@ -119,6 +124,14 @@ class LegBuildConfig:
     chunk_size: int = 20000
 
     leg_filter: Optional[Callable[..., np.ndarray]] = None
+
+    def __post_init__(self):
+        if np.isnan(self.lt_dv_max_km_s) or self.lt_dv_max_km_s < 0:
+            raise ValueError("lt_dv_max_km_s must be nonnegative or +inf.")
+        if self.acc_lt_max_km_s2 > 0:
+            from star.maneuver_placement import _solve_arc_normalize_lev_types
+            if any(mode not in ("+-", "-+") for mode in _solve_arc_normalize_lev_types(1, self.lev_type)):
+                raise ValueError("Low-thrust lev_type must contain only '+-' and/or '-+'.")
 
 
 @dataclass
@@ -138,6 +151,8 @@ class LegDatabase:
         n_rev: Signed Lambert revolution count per row — positive = prograde multi-rev.
         dv_lev_km_s: DSM leveraging delta-v magnitude [km/s] per row (0 if no DSM).
         eta_lev: DSM placement fraction along the arc [0, 1] per row (0 if no DSM).
+        acc_lt_km_s2: Full-duration constant low-thrust acceleration [km/s^2] per row.
+        lt_lev_type: Signed steering mode; magnitude 2 is quadratic, 1 is legacy linear, 0 is untagged/binned.
     """
 
     IL: np.ndarray
@@ -155,6 +170,31 @@ class LegDatabase:
     dv_lev_km_s: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
     # DSM split-arc fraction eta in [0,1] per leg row.
     eta_lev: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
+
+    # low-thrust fields:
+    acc_lt_km_s2: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
+    lt_lev_type: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    # Optional sidecar, aligned with IL: nominal v0/vf (6), angle, target speeds (2).
+    lt_control: Optional[np.ndarray] = None
+
+    def __post_init__(self) -> None:
+        """Normalize optional low-thrust metadata for ballistic callers."""
+
+        row_count = int(np.asarray(self.IL).size)
+        if self.lt_control is not None:
+            self.lt_control = np.asarray(self.lt_control, dtype=float)
+            if self.lt_control.shape != (row_count, 9):
+                raise ValueError("lt_control must have shape (N,9), aligned with IL.")
+        acc = np.asarray(self.acc_lt_km_s2, dtype=float).reshape(-1)
+        lt_type = np.asarray(self.lt_lev_type, dtype=np.int64).reshape(-1)
+        if acc.size == 0:
+            acc = np.zeros(row_count, dtype=float)
+        if lt_type.size == 0:
+            lt_type = np.zeros(row_count, dtype=np.int64)
+        if acc.shape != (row_count,) or lt_type.shape != (row_count,):
+            raise ValueError("Low-thrust metadata must match the LegDatabase row count.")
+        self.acc_lt_km_s2 = acc
+        self.lt_lev_type = lt_type
 
     @property
     def leg_id(self) -> np.ndarray:
@@ -666,6 +706,8 @@ def _empty_leg_db(stage_id: int) -> LegDatabase:
         n_rev=empty_i,
         dv_lev_km_s=empty_f,
         eta_lev=empty_f,
+        acc_lt_km_s2=empty_f,
+        lt_lev_type=empty_i,
     )
 
 
@@ -707,6 +749,20 @@ def _relaxed_pre_filter_vinf_max_km_s(vinf_max_km_s: float, margin_km_s: float) 
     return 1.0e9
 
 
+def _build_acc_lt_grid_km_s2(max_km_s2: float, delta_km_s2: float) -> np.ndarray:
+    """Build non-zero low-thrust acceleration grid [km/s^2] up to max."""
+
+    acc_max = float(max_km_s2)
+    if not np.isfinite(acc_max) or acc_max < 0.0:
+        raise ValueError("acc_lt_max_km_s2 must be finite and >= 0.")
+    if acc_max <= 1.0e-12:
+        return np.empty(0, dtype=float)
+
+    from star.low_thrust import build_acc_lt_grid_km_s2
+
+    return np.asarray(build_acc_lt_grid_km_s2(acc_max, delta_km_s2), dtype=float).reshape(-1)
+
+
 def _process_lambert_chunk(
     *,
     dep_data: Dict[str, np.ndarray],
@@ -744,6 +800,7 @@ def _process_lambert_chunk(
     r_arr_seed_km = r_arr_km[source_idx]
     v_body_dep_seed_km_s = v_body_dep_km_s[source_idx]
     v_body_arr_seed_km_s = v_body_arr_km_s[source_idx]
+    acc_lt_grid_km_s2 = _build_acc_lt_grid_km_s2(float(cfg.acc_lt_max_km_s2), float(cfg.delta_acc_lt_km_s2))
 
     # Optional solve_arc expansion: preserve Lambert-only behavior when dV grid is empty.
     if dV_lev_grid_km_s.size > 0:
@@ -810,6 +867,76 @@ def _process_lambert_chunk(
         dep_rows_eval = dep_rows_chunk[source_rows_eval]
         arr_rows_eval = arr_rows_chunk[source_rows_eval]
         n_rev_eval_rows = nrev_signed_eval[arc_store]
+        acc_lt_all = np.zeros(dV_lev_all.shape[0], dtype=float)
+        lt_type_all = np.zeros(dV_lev_all.shape[0], dtype=np.int64)
+    elif acc_lt_grid_km_s2.size > 0:
+        # shortcut: frozen-primer quadratic endpoints are local; refine selected arcs when misses matter.
+        from star.low_thrust import solve_arc_low_thrust
+        from star.maneuver_placement import _solve_arc_normalize_lev_types
+
+        lev_modes = _solve_arc_normalize_lev_types(1, cfg.lev_type)
+        lt_code_by_mode = {"+-": 2, "-+": -2}
+        max_vinf0_solve_arc = _relaxed_pre_filter_vinf_max_km_s(
+            vinfD_max_km_s, cfg.vinf_margin_pre_filter_km_s)
+        max_vinff_solve_arc = _relaxed_pre_filter_vinf_max_km_s(
+            vinfA_max_km_s, cfg.vinf_margin_pre_filter_km_s)
+        n_seed, n_mode = int(source_idx.size), len(lev_modes)
+        valid_mode = np.zeros((n_seed, n_mode), dtype=bool)
+        sensitivity_dep = np.zeros((n_seed, n_mode, 3))
+        sensitivity_arr = np.zeros((n_seed, n_mode, 3))
+        second_dep = np.zeros((n_seed, n_mode, 3))
+        second_arr = np.zeros((n_seed, n_mode, 3))
+
+        for mode_idx, lev_mode in enumerate(lev_modes):
+            result = solve_arc_low_thrust(
+                r_dep_seed_km,
+                r_arr_seed_km,
+                v_body_dep_seed_km_s,
+                v_body_arr_seed_km_s,
+                v_dep_km_s,
+                v_arr_km_s,
+                nrev_signed_eval,
+                [0.0],  # Only the sensitivities are needed; scale them while emitting rows.
+                cfg.lambert_mu_km3_s2,
+                lev_type=lev_mode,
+                max_vinf0_km_s=max_vinf0_solve_arc,
+                max_vinff_km_s=max_vinff_solve_arc,
+                num_nu=400,
+                return_profile=False,
+                debug=False,
+            )
+            result_seeds = np.asarray(result["seed_idx"], dtype=np.int64).reshape(-1)
+            valid_mode[result_seeds, mode_idx] = True
+            sensitivity_dep[result_seeds, mode_idx] = result["dVinf0_vec_da_s"]
+            sensitivity_arr[result_seeds, mode_idx] = result["dVinff_vec_da_s"]
+            second_dep[result_seeds, mode_idx] = result["d2Vinf0_vec_da2_s3_km"]
+            second_arr[result_seeds, mode_idx] = result["d2Vinff_vec_da2_s3_km"]
+
+        affordable = acc_lt_grid_km_s2[None, :] * dt_seed_s[:, None] <= cfg.lt_dv_max_km_s
+        eligible = np.ones((n_seed, 1 + acc_lt_grid_km_s2.size * n_mode), dtype=bool)
+        eligible[:, 1:] = (affordable[:, :, None] & valid_mode[:, None, :]).reshape(n_seed, -1)
+        # C-order keeps each seed's ballistic row, then acceleration and preference order.
+        lt_seed_rows, slots = np.nonzero(eligible)
+        acc_by_slot = np.concatenate(([0.0], np.repeat(acc_lt_grid_km_s2, n_mode)))
+        code_by_slot = np.concatenate(([0], np.tile(
+            [lt_code_by_mode[mode] for mode in lev_modes], acc_lt_grid_km_s2.size)))
+        acc_lt_all = acc_by_slot[slots]
+        lt_type_all = code_by_slot[slots]
+        dep_rows_eval, arr_rows_eval = dep_rows_seed[lt_seed_rows], arr_rows_seed[lt_seed_rows]
+        n_rev_eval_rows = nrev_signed_eval[lt_seed_rows]
+        vinfD_km_s_all = (v_dep_km_s - v_body_dep_seed_km_s)[lt_seed_rows]
+        vinfA_km_s_all = (v_arr_km_s - v_body_arr_seed_km_s)[lt_seed_rows]
+        thrust_rows = slots > 0
+        thrust_seeds = lt_seed_rows[thrust_rows]
+        thrust_modes = (slots[thrust_rows] - 1) % n_mode
+        vinfD_km_s_all[thrust_rows] += (
+            acc_lt_all[thrust_rows, None] * sensitivity_dep[thrust_seeds, thrust_modes]
+            + 0.5 * acc_lt_all[thrust_rows, None]**2 * second_dep[thrust_seeds, thrust_modes])
+        vinfA_km_s_all[thrust_rows] += (
+            acc_lt_all[thrust_rows, None] * sensitivity_arr[thrust_seeds, thrust_modes]
+            + 0.5 * acc_lt_all[thrust_rows, None]**2 * second_arr[thrust_seeds, thrust_modes])
+        dV_lev_all = np.zeros(acc_lt_all.size)
+        eta_lev_all = np.zeros(acc_lt_all.size)
     else:
         dep_rows_eval = dep_rows_chunk[source_idx]
         arr_rows_eval = arr_rows_chunk[source_idx]
@@ -818,6 +945,8 @@ def _process_lambert_chunk(
         vinfA_km_s_all = v_arr_km_s - v_body_arr_km_s[source_idx]
         eta_lev_all = np.full(source_idx.shape[0], 0.5, dtype=float)
         n_rev_eval_rows = nrev_signed_eval
+        acc_lt_all = np.zeros(source_idx.shape[0], dtype=float)
+        lt_type_all = np.zeros(source_idx.shape[0], dtype=np.int64)
 
     dep_rows_res = np.empty(0, dtype=np.int64)
     arr_rows_res = np.empty(0, dtype=np.int64)
@@ -861,6 +990,8 @@ def _process_lambert_chunk(
         vinfA_km_s_all = np.concatenate((vinfA_km_s_all, vinfA_res_km_s), axis=0)
         eta_lev_all = np.concatenate((eta_lev_all, np.full(dep_rows_res.size, 0.5, dtype=float)))
         n_rev_eval_rows = np.concatenate((n_rev_eval_rows, n_rev_res))
+        acc_lt_all = np.concatenate((acc_lt_all, np.zeros(dep_rows_res.size, dtype=float)))
+        lt_type_all = np.concatenate((lt_type_all, np.zeros(dep_rows_res.size, dtype=np.int64)))
 
     solved_mask = np.all(np.isfinite(vinfD_km_s_all), axis=1)
     solved_mask &= np.all(np.isfinite(vinfA_km_s_all), axis=1)
@@ -894,7 +1025,20 @@ def _process_lambert_chunk(
         "n_rev": n_rev_eval_rows[keep_mask],
         "dv_lev_km_s": dV_lev_all[keep_mask],
         "eta_lev": eta_lev_all[keep_mask],
+        "acc_lt_km_s2": acc_lt_all[keep_mask],
+        "lt_lev_type": lt_type_all[keep_mask],
     }
+    if acc_lt_grid_km_s2.size > 0:
+        lt_control = np.full((kept_dep_rows.size, 9), np.nan)
+        thrust_rows = base_rows["acc_lt_km_s2"] > 0.0
+        thrust_seeds = lt_seed_rows[keep_mask][thrust_rows]
+        lt_control[thrust_rows, :3] = v_dep_km_s[thrust_seeds]
+        lt_control[thrust_rows, 3:6] = v_arr_km_s[thrust_seeds]
+        lt_control[thrust_rows, 6] = np.where(
+            base_rows["lt_lev_type"][thrust_rows] > 0, 3 * np.pi / 4, -np.pi / 4)
+        lt_control[thrust_rows, 7] = np.sqrt(vinfD_sq_km_s2[keep_mask][thrust_rows])
+        lt_control[thrust_rows, 8] = np.sqrt(vinfA_sq_km_s2[keep_mask][thrust_rows])
+        base_rows["lt_control"] = lt_control
     return base_rows
 
 
@@ -997,6 +1141,11 @@ def build_leg_db(
     if bool(cfg.resonant_enabled) and (not np.isfinite(vinfD_min_km_s) or not np.isfinite(vinfD_max_km_s)):
         raise ValueError("Resonant sampling requires finite departure v-infinity bounds.")
     dV_lev_grid_km_s = _build_dv_lev_grid_km_s(float(cfg.dvlev_max_km_s), float(cfg.delta_dvlev_km_s))
+    acc_lt_grid_km_s2 = _build_acc_lt_grid_km_s2(float(cfg.acc_lt_max_km_s2), float(cfg.delta_acc_lt_km_s2))
+    if dV_lev_grid_km_s.size > 0 and acc_lt_grid_km_s2.size > 0:
+        raise ValueError("DSM and low-thrust leveraging cannot both be active for the same leg.")
+    if bool(cfg.resonant_enabled) and acc_lt_grid_km_s2.size > 0:
+        raise ValueError("Low-thrust leveraging does not support resonant expansion in this builder.")
 
     dep_data = _get_stage_arrays(enc_db, cfg.dep_stage_id, stage_arrays_cache)
     arr_data = _get_stage_arrays(enc_db, cfg.arr_stage_id, stage_arrays_cache)
@@ -1028,6 +1177,9 @@ def build_leg_db(
         "n_rev": [],
         "dv_lev_km_s": [],
         "eta_lev": [],
+        "acc_lt_km_s2": [],
+        "lt_lev_type": [],
+        "lt_control": [],
     }
     candidate_chunk_size = max(1, int(cfg.chunk_size))
     for dep_rows_chunk, arr_rows_chunk, dt_candidates_chunk_s in _iter_candidate_pair_chunks_from_counts(
@@ -1101,6 +1253,8 @@ def build_leg_db(
     n_rev = np.concatenate(out_parts["n_rev"], axis=0)
     kept_dv_lev_km_s = np.concatenate(out_parts["dv_lev_km_s"], axis=0)
     kept_eta_lev = np.concatenate(out_parts["eta_lev"], axis=0)
+    kept_acc_lt_km_s2 = np.concatenate(out_parts["acc_lt_km_s2"], axis=0)
+    kept_lt_lev_type = np.concatenate(out_parts["lt_lev_type"], axis=0)
 
     filtered_rows = _apply_custom_leg_filter(
         cfg,
@@ -1114,6 +1268,9 @@ def build_leg_db(
             "n_rev": n_rev,
             "dv_lev_km_s": kept_dv_lev_km_s,
             "eta_lev": kept_eta_lev,
+            "acc_lt_km_s2": kept_acc_lt_km_s2,
+            "lt_lev_type": kept_lt_lev_type,
+            **({"lt_control": np.concatenate(out_parts["lt_control"])} if out_parts["lt_control"] else {}),
         },
     )
     kept_ID = np.asarray(filtered_rows["ID"], dtype=np.int64)
@@ -1123,6 +1280,8 @@ def build_leg_db(
     n_rev = np.asarray(filtered_rows["n_rev"], dtype=np.int64)
     kept_dv_lev_km_s = np.asarray(filtered_rows["dv_lev_km_s"], dtype=float)
     kept_eta_lev = np.asarray(filtered_rows["eta_lev"], dtype=float)
+    kept_acc_lt_km_s2 = np.asarray(filtered_rows["acc_lt_km_s2"], dtype=float)
+    kept_lt_lev_type = np.asarray(filtered_rows["lt_lev_type"], dtype=np.int64)
 
     if kept_ID.shape[0] == 0:
         return _empty_leg_db(cfg.leg_stage_id)
@@ -1140,6 +1299,9 @@ def build_leg_db(
         n_rev=n_rev,
         dv_lev_km_s=kept_dv_lev_km_s,
         eta_lev=kept_eta_lev,
+        acc_lt_km_s2=kept_acc_lt_km_s2,
+        lt_lev_type=kept_lt_lev_type,
+        lt_control=filtered_rows.get("lt_control"),
     )
 
     if cfg.debug:
@@ -1152,6 +1314,9 @@ def build_leg_db(
         assert np.all(np.isfinite(leg_db.dv_lev_km_s))
         assert leg_db.eta_lev.shape == (leg_db.IL.size,)
         assert np.all(np.isfinite(leg_db.eta_lev))
+        assert leg_db.acc_lt_km_s2.shape == (leg_db.IL.size,)
+        assert np.all(np.isfinite(leg_db.acc_lt_km_s2))
+        assert leg_db.lt_lev_type.shape == (leg_db.IL.size,)
 
     return leg_db
 
@@ -1189,6 +1354,11 @@ def build_leg_stage_to_disk(
     if bool(cfg.resonant_enabled) and (not np.isfinite(vinfD_min_km_s) or not np.isfinite(vinfD_max_km_s)):
         raise ValueError("Resonant sampling requires finite departure v-infinity bounds.")
     dV_lev_grid_km_s = _build_dv_lev_grid_km_s(float(cfg.dvlev_max_km_s), float(cfg.delta_dvlev_km_s))
+    acc_lt_grid_km_s2 = _build_acc_lt_grid_km_s2(float(cfg.acc_lt_max_km_s2), float(cfg.delta_acc_lt_km_s2))
+    if dV_lev_grid_km_s.size > 0 and acc_lt_grid_km_s2.size > 0:
+        raise ValueError("DSM and low-thrust leveraging cannot both be active for the same leg.")
+    if bool(cfg.resonant_enabled) and acc_lt_grid_km_s2.size > 0:
+        raise ValueError("Low-thrust leveraging does not support resonant expansion in this builder.")
 
     dep_data = _get_stage_arrays(enc_db, cfg.dep_stage_id, stage_arrays_cache)
     arr_data = _get_stage_arrays(enc_db, cfg.arr_stage_id, stage_arrays_cache)
@@ -1213,6 +1383,8 @@ def build_leg_stage_to_disk(
                     n_rev=np.asarray(post_rows["n_rev"], dtype=np.int64),
                     dv_lev_km_s=np.asarray(post_rows["dv_lev_km_s"], dtype=float),
                     eta_lev=np.asarray(post_rows["eta_lev"], dtype=float),
+                    acc_lt_km_s2=np.asarray(post_rows["acc_lt_km_s2"], dtype=float),
+                    lt_lev_type=np.asarray(post_rows["lt_lev_type"], dtype=np.int64),
                 )
             return int(writer.finalize())
         except Exception:
@@ -1238,6 +1410,9 @@ def build_leg_stage_to_disk(
             "n_rev": [],
             "dv_lev_km_s": [],
             "eta_lev": [],
+            "acc_lt_km_s2": [],
+            "lt_lev_type": [],
+            "lt_control": [],
         }
     try:
         for dep_rows_chunk, arr_rows_chunk, dt_candidates_chunk_s in _iter_candidate_pair_chunks_from_counts(
@@ -1293,6 +1468,9 @@ def build_leg_stage_to_disk(
                     n_rev=np.asarray(chunk_output["n_rev"], dtype=np.int64),
                     dv_lev_km_s=np.asarray(chunk_output["dv_lev_km_s"], dtype=float),
                     eta_lev=np.asarray(chunk_output["eta_lev"], dtype=float),
+                    acc_lt_km_s2=np.asarray(chunk_output["acc_lt_km_s2"], dtype=float),
+                    lt_lev_type=np.asarray(chunk_output["lt_lev_type"], dtype=np.int64),
+                    lt_control=chunk_output.get("lt_control"),
                 )
             else:
                 for key, value in chunk_output.items():
@@ -1319,6 +1497,10 @@ def build_leg_stage_to_disk(
                     "n_rev": np.concatenate(collected_parts["n_rev"], axis=0),
                     "dv_lev_km_s": np.concatenate(collected_parts["dv_lev_km_s"], axis=0),
                     "eta_lev": np.concatenate(collected_parts["eta_lev"], axis=0),
+                    "acc_lt_km_s2": np.concatenate(collected_parts["acc_lt_km_s2"], axis=0),
+                    "lt_lev_type": np.concatenate(collected_parts["lt_lev_type"], axis=0),
+                    **({"lt_control": np.concatenate(collected_parts["lt_control"])}
+                       if collected_parts["lt_control"] else {}),
                 },
             )
             if int(np.asarray(filtered_rows["ID"], dtype=np.int64).size) > 0:
@@ -1330,6 +1512,9 @@ def build_leg_stage_to_disk(
                     n_rev=np.asarray(filtered_rows["n_rev"], dtype=np.int64),
                     dv_lev_km_s=np.asarray(filtered_rows["dv_lev_km_s"], dtype=float),
                     eta_lev=np.asarray(filtered_rows["eta_lev"], dtype=float),
+                    acc_lt_km_s2=np.asarray(filtered_rows["acc_lt_km_s2"], dtype=float),
+                    lt_lev_type=np.asarray(filtered_rows["lt_lev_type"], dtype=np.int64),
+                    lt_control=filtered_rows.get("lt_control"),
                 )
 
         if post_rows is not None and int(np.asarray(post_rows["ID"], dtype=np.int64).size) > 0:
@@ -1341,6 +1526,8 @@ def build_leg_stage_to_disk(
                 n_rev=np.asarray(post_rows["n_rev"], dtype=np.int64),
                 dv_lev_km_s=np.asarray(post_rows["dv_lev_km_s"], dtype=float),
                 eta_lev=np.asarray(post_rows["eta_lev"], dtype=float),
+                acc_lt_km_s2=np.asarray(post_rows["acc_lt_km_s2"], dtype=float),
+                lt_lev_type=np.asarray(post_rows["lt_lev_type"], dtype=np.int64),
             )
         return int(writer.finalize())
     except Exception:
@@ -1423,6 +1610,10 @@ if __name__ == "__main__":
     vinf_margin_pre_filter_raw = getattr(example, "vinf_margin_pre_filter", None)
     if vinf_margin_pre_filter_raw is None:
         vinf_margin_pre_filter_raw = getattr(example, "vinf_margin_pre_filter_km_s", 10.0)
+    acc_lt_max_raw = getattr(example, "acc_lt_max", [0.0] * n_legs)
+    delta_acc_lt_raw = getattr(example, "dacc_lt", None)
+    if delta_acc_lt_raw is None:
+        delta_acc_lt_raw = getattr(example, "delta_acc_lt", [0.0] * n_legs)
     lev_type_raw = getattr(example, "lev_type", ["+-", "-+"])
 
     if np.isscalar(nrev_raw):
@@ -1460,6 +1651,20 @@ if __name__ == "__main__":
     if len(vinf_margin_pre_filter_by_leg) < n_legs:
         raise ValueError(f"Need at least {n_legs} vinf_margin_pre_filter entries.")
 
+    if np.isscalar(acc_lt_max_raw):
+        acc_lt_max_by_leg = [float(acc_lt_max_raw)] * n_legs
+    else:
+        acc_lt_max_by_leg = [float(v) for v in list(acc_lt_max_raw)]
+    if len(acc_lt_max_by_leg) < n_legs:
+        raise ValueError(f"Need at least {n_legs} acc_lt_max entries.")
+
+    if np.isscalar(delta_acc_lt_raw):
+        delta_acc_lt_by_leg = [float(delta_acc_lt_raw)] * n_legs
+    else:
+        delta_acc_lt_by_leg = [float(v) for v in list(delta_acc_lt_raw)]
+    if len(delta_acc_lt_by_leg) < n_legs:
+        raise ValueError(f"Need at least {n_legs} dacc_lt entries.")
+
     if isinstance(lev_type_raw, str):
         lev_type = (lev_type_raw,)
     else:
@@ -1492,6 +1697,8 @@ if __name__ == "__main__":
             dvlev_max_km_s=float(dvlev_max_by_leg[leg_index]),
             delta_dvlev_km_s=float(delta_dvlev_by_leg[leg_index]),
             vinf_margin_pre_filter_km_s=float(vinf_margin_pre_filter_by_leg[leg_index]),
+            acc_lt_max_km_s2=float(acc_lt_max_by_leg[leg_index]),
+            delta_acc_lt_km_s2=float(delta_acc_lt_by_leg[leg_index]),
             lev_type=lev_type,
             parallelism=None,
             dt_positive_tol_s=1e-6,

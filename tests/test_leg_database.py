@@ -249,6 +249,8 @@ class LegDatabaseConstructionTest(unittest.TestCase):
             "n_rev",
             "dv_lev_km_s",
             "eta_lev",
+            "acc_lt_km_s2",
+            "lt_lev_type",
         ):
             actual_value = np.asarray(getattr(actual, field_name))
             expected_value = np.asarray(getattr(expected, field_name))
@@ -257,6 +259,11 @@ class LegDatabaseConstructionTest(unittest.TestCase):
                 np.testing.assert_allclose(actual_value, expected_value, rtol=1e-12, atol=1e-12, err_msg=field_name)
             else:
                 np.testing.assert_array_equal(actual_value, expected_value, err_msg=field_name)
+        if expected.lt_control is None:
+            self.assertIsNone(actual.lt_control)
+        else:
+            np.testing.assert_allclose(actual.lt_control, expected.lt_control,
+                                       rtol=1e-12, atol=1e-12, equal_nan=True)
 
     def _build_leg_db_reference_from_full_candidates(
         self,
@@ -293,6 +300,8 @@ class LegDatabaseConstructionTest(unittest.TestCase):
             "n_rev": [],
             "dv_lev_km_s": [],
             "eta_lev": [],
+            "acc_lt_km_s2": [],
+            "lt_lev_type": [],
         }
         chunk_size = max(1, int(cfg.chunk_size))
         for start in range(0, int(dt_candidates_s.size), chunk_size):
@@ -348,6 +357,8 @@ class LegDatabaseConstructionTest(unittest.TestCase):
         n_rev = np.concatenate(out_parts["n_rev"], axis=0)
         kept_dv_lev_km_s = np.concatenate(out_parts["dv_lev_km_s"], axis=0)
         kept_eta_lev = np.concatenate(out_parts["eta_lev"], axis=0)
+        kept_acc_lt_km_s2 = np.concatenate(out_parts["acc_lt_km_s2"], axis=0)
+        kept_lt_lev_type = np.concatenate(out_parts["lt_lev_type"], axis=0)
 
         if cfg.leg_filter is not None:
             dep_ie_order = np.argsort(dep_data["IE"])
@@ -375,6 +386,8 @@ class LegDatabaseConstructionTest(unittest.TestCase):
             n_rev = n_rev[custom_keep]
             kept_dv_lev_km_s = kept_dv_lev_km_s[custom_keep]
             kept_eta_lev = kept_eta_lev[custom_keep]
+            kept_acc_lt_km_s2 = kept_acc_lt_km_s2[custom_keep]
+            kept_lt_lev_type = kept_lt_lev_type[custom_keep]
 
         if kept_ID.shape[0] == 0:
             return leg_database._empty_leg_db(cfg.leg_stage_id)
@@ -389,6 +402,8 @@ class LegDatabaseConstructionTest(unittest.TestCase):
             n_rev=n_rev,
             dv_lev_km_s=kept_dv_lev_km_s,
             eta_lev=kept_eta_lev,
+            acc_lt_km_s2=kept_acc_lt_km_s2,
+            lt_lev_type=kept_lt_lev_type,
         )
 
     def test_build_leg_db_stage_array_cache_reuses_stage_materialization(self) -> None:

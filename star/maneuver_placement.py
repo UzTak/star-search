@@ -1,5 +1,5 @@
 """
-Landau, "Efficient Maneuver Placement for Automated Trajectory Design" (2022).
+Landau, "Efficient Maneuver Placement for Automated Trajectory Design" (2018).
 
 This maneuver placement algorithm answers:
    Given: R0, Rf, t0, tf, mu, J (objective), and DV magnitude
@@ -254,14 +254,14 @@ def solve_primer_coefficients(primer_geometry, dJ_dV0_batch, dJ_dVf_batch):
 
     a_rt = np.zeros((n_seed, 4, 4), dtype=float)
     a_rt[:, 0, 0] = np.cos(nu0)
-    a_rt[:, 0, 1] = -e * np.sin(nu0)
+    a_rt[:, 0, 1] = e * np.sin(nu0)
     a_rt[:, 0, 2] = I1(e, nu0, M0)
     a_rt[:, 1, 0] = -(1.0 + r0_p) * np.sin(nu0)
     a_rt[:, 1, 1] = p_r0
     a_rt[:, 1, 2] = I2(e, nu0, M0)
     a_rt[:, 1, 3] = r0_p
     a_rt[:, 2, 0] = np.cos(nuf)
-    a_rt[:, 2, 1] = -e * np.sin(nuf)
+    a_rt[:, 2, 1] = e * np.sin(nuf)
     a_rt[:, 2, 2] = I1(e, nuf, Mf)
     a_rt[:, 3, 0] = -(1.0 + rf_p) * np.sin(nuf)
     a_rt[:, 3, 1] = p_rf
@@ -301,11 +301,34 @@ def solve_primer_coefficients(primer_geometry, dJ_dV0_batch, dJ_dVf_batch):
     }
 
 
-def primer_vector_from_coeffs(nu, e, A, B, C, D, E, F):
-    """Evaluate the analytic conic primer vector in RTN coordinates."""
-    nu_b, e_b, A_b, B_b, C_b, D_b, E_b, F_b = np.broadcast_arrays(
+def _conic_primer_basis(nu, e):
+    """Return common conic factors without expanding a primer-field axis."""
+    e_arr = np.asarray(e, dtype=float)
+    nu_b, e_b = np.broadcast_arrays(
         np.asarray(nu, dtype=float),
-        np.asarray(e, dtype=float),
+        e_arr,
+    )
+    M = _true_to_mean(nu_b.reshape(-1), e_b.reshape(-1)).reshape(nu_b.shape)
+    sin_nu = np.sin(nu_b)
+    cos_nu = np.cos(nu_b)
+    denom = 1.0 + e_b * cos_nu
+    # Keep eccentricity-only factors at the input shape, once per seed in LT batches.
+    e_sq = e_arr ** 2
+    inv_one_minus_e_sq = 1.0 / (1.0 - e_sq)
+    one_minus_e_sq_3_2 = np.power(1.0 - e_sq, 1.5)
+    i1 = inv_one_minus_e_sq * (
+        2.0 * e_arr / denom - cos_nu
+        - 3.0 * e_sq * M * sin_nu / one_minus_e_sq_3_2)
+    i2 = inv_one_minus_e_sq * (
+        (1.0 + 1.0 / denom) * sin_nu
+        - 3.0 * e_arr * M * denom / one_minus_e_sq_3_2)
+    return e_b, sin_nu, cos_nu, denom, i1, i2
+
+
+def _primer_vector_from_basis(basis, A, B, C, D, E, F):
+    """Apply primer coefficients to previously evaluated conic factors."""
+    e_b, sin_nu, cos_nu, denom, i1, i2 = basis
+    A_b, B_b, C_b, D_b, E_b, F_b = np.broadcast_arrays(
         np.asarray(A, dtype=float),
         np.asarray(B, dtype=float),
         np.asarray(C, dtype=float),
@@ -313,22 +336,33 @@ def primer_vector_from_coeffs(nu, e, A, B, C, D, E, F):
         np.asarray(E, dtype=float),
         np.asarray(F, dtype=float),
     )
-    nu_flat = nu_b.reshape(-1)
-    e_flat = e_b.reshape(-1)
-    M_flat = _true_to_mean(nu_flat, e_flat)
-    sin_nu = np.sin(nu_flat)
-    cos_nu = np.cos(nu_flat)
-    denom = 1.0 + e_flat * cos_nu
-
-    p_R = A_b.reshape(-1) * cos_nu - B_b.reshape(-1) * e_flat * sin_nu + C_b.reshape(-1) * I1(e_flat, nu_flat, M_flat)
+    p_R = A_b * cos_nu + B_b * e_b * sin_nu + C_b * i1
     p_T = (
-        -A_b.reshape(-1) * sin_nu
-        + B_b.reshape(-1) * (1.0 + e_flat * cos_nu)
-        + (D_b.reshape(-1) - A_b.reshape(-1) * sin_nu) / denom
-        + C_b.reshape(-1) * I2(e_flat, nu_flat, M_flat)
+        -A_b * sin_nu
+        + B_b * denom
+        + (D_b - A_b * sin_nu) / denom
+        + C_b * i2
     )
-    p_N = (E_b.reshape(-1) * cos_nu + F_b.reshape(-1) * sin_nu) / denom
-    return np.stack((p_R, p_T, p_N), axis=1).reshape(nu_b.shape + (3,))
+    p_N = (E_b * cos_nu + F_b * sin_nu) / denom
+    return np.stack((p_R, p_T, p_N), axis=-1)
+
+
+def primer_vector_from_coeffs(nu, e, A, B, C, D, E, F):
+    """Evaluate the analytic conic primer vector in RTN coordinates."""
+    return _primer_vector_from_basis(_conic_primer_basis(nu, e), A, B, C, D, E, F)
+
+
+def conic_dt_dnu(nu, p, h, e):
+    """Return ``dt/dnu`` for a two-body conic arc."""
+
+    nu_b, p_b, h_b, e_b = np.broadcast_arrays(
+        np.asarray(nu, dtype=float),
+        np.asarray(p, dtype=float),
+        np.asarray(h, dtype=float),
+        np.asarray(e, dtype=float),
+    )
+    radius = p_b / (1.0 + e_b * np.cos(nu_b))
+    return (radius * radius) / h_b
 
 
 def _vinf_objective_weights(objective, lev_type="+-"):
@@ -429,7 +463,7 @@ def _primer_norm_sq_grad_hess_scalar_jit(nu, ei, Ai, Bi, Ci, Di, Ei, Fi):
     denom  = 1.0 + ei * cos_nu
     r_p    = 1.0 / denom
 
-    p_R = Ai * cos_nu - Bi * ei * sin_nu + Ci * _I1_scalar_jit(ei, nu, M)
+    p_R = Ai * cos_nu + Bi * ei * sin_nu + Ci * _I1_scalar_jit(ei, nu, M)
     p_T = (
         -Ai * sin_nu
         + Bi * (1.0 + ei * cos_nu)
@@ -439,11 +473,16 @@ def _primer_norm_sq_grad_hess_scalar_jit(nu, ei, Ai, Bi, Ci, Di, Ei, Fi):
     p_N = (Ei * cos_nu + Fi * sin_nu) * r_p
 
     r_p2 = r_p * r_p
-    r_p3 = r_p2 * r_p
-    dp_R  = p_T * (1.0 - r_p) - (Ai * sin_nu - Ci * sin_nu + Di * ei * cos_nu) * r_p2
-    dp_T  = (Ai * ei + p_T * ei * sin_nu + Di * ei * cos_nu) * r_p - 2.0 * p_R
+    k = 1.0 - ei * ei
+    secular = 3.0 * ei * ei * M / k**1.5
+    dI1 = (sin_nu - ei * ei * sin_nu * r_p2 - secular * cos_nu) / k
+    dI2 = ((1.0 + r_p) * cos_nu + ei * sin_nu * sin_nu * r_p2
+           - 3.0 * ei * r_p + secular * sin_nu) / k
+    dp_R = -Ai * sin_nu + Bi * ei * cos_nu + Ci * dI1
+    dp_T = (-Ai * (1.0 + r_p) * cos_nu - Ai * ei * sin_nu * sin_nu * r_p2
+            - Bi * ei * sin_nu + Di * ei * sin_nu * r_p2 + Ci * dI2)
     dp_N  = (-Ei * sin_nu + ei * Fi + Fi * cos_nu) * r_p2
-    d2p_R = 2.0 * ei * Ci * r_p3 - p_R
+    d2p_R = 2.0 * dp_T + (1.0 + 2.0 * r_p) * p_R + 2.0 * ei * sin_nu * (dp_R - p_T) * r_p
     d2p_T = p_T * (1.0 - r_p) + 2.0 * ei * sin_nu * (dp_T + p_R) * r_p - 2.0 * dp_R
     d2p_N = (2.0 * ei * dp_N * sin_nu - p_N) * r_p
 
