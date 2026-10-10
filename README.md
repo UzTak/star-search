@@ -1,6 +1,8 @@
 # Star: Global interplanetary mission design tool 
 
-**Star** [1] is a broad-search algorithm for patched-conic interplanetary mission design. 
+<img width="703" height="353" alt="Screenshot 2026-07-28 125846" src="https://github.com/user-attachments/assets/8ed7281c-cc0e-4f82-a9ae-aeb377083409" />
+
+**Star** [1] is a broad-search algorithm for patched-conic interplanetary mission design, originally developed by Damon Landau. 
 The unique advantage of this algorithm is that the search time is polynomial by adopting the philosophy of "patch pre-generated Lambert arcs" via powered flyby (i.e., $\Delta V$ at the patch point) with the discretized encounter epochs with each planetary body. With additional heuristics, Star enables a scalable broad-search for multi-flyby trajectories and serves as a strong preliminary trajectory design/analysis tool. 
 
 This codebase summarizes the three algorithms shown here: (Star search logic [1], Efficient mid-arc maneuver placement algorithm [2], and Lambert solver [3]). 
@@ -10,6 +12,8 @@ This codebase summarizes the three algorithms shown here: (Star search logic [1]
 [2] Landau, D. (2018). Efficient maneuver placement for automated trajectory design. Journal of Guidance, Control, and Dynamics, 41(7), 1531-1541.
 
 [3] Arora, N., Russell, R.P. (2013). A fast and robust multiple revolution Lambert algorithm using a cosine transformation. AAS/AIAA Astrodynamics Specialist Conference, AAS 13-728, Hilton Head, SC. 
+
+Disclaimer: This codebase is an independent re-implementation of the method presented in [1]. Its performance may differ from, and potentially be lower than, the results reported in the original paper. The repository is intended to provide an open-source benchmark and to promote broader use and evaluation of the Star algorithm.
 
 ## Quick Start
 
@@ -164,7 +168,7 @@ uv run pytest
 
 ## Acknowledgement
 
-Special thanks to Star authors (Damon Landau, Stefano Campagnola, and Etienne Pellegrini) for insightful discussions and cross-validations of preliminary results. 
+Special thanks to Damon Landau, Stefano Campagnola, and Etienne Pellegrini for insightful discussions, cross-validations of preliminary results, and overall support on this project. 
 AI coding tools are used extensively to make this codebase. 
 
 ## License
