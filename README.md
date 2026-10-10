@@ -92,7 +92,7 @@ uses a linearized response; here, first-order primer steering is paired with
 quadratic departure and arrival velocity estimates:
 
 $$
-\mathbf{v}_{\infty,k}(a) \approx \mathbf{v}_{\infty,k}^{(0)} + a\,\mathbf{s}_{1,k} + \frac{1}{2}a^2\,\mathbf{s}_{2,k}, \qquad k\in\{D,A\}.
+\mathbf{v}_{\infty,k}(a) \approx \mathbf{v}_{\infty,k}^{(0)} + a \mathbf{s}_{1,k} + \frac{1}{2}a^2 \mathbf{s}_{2,k}, \qquad k\in\{D,A\}.
 $$
 
 Here $a$ is the sampled constant acceleration, and $\mathbf s_{1,k}$ and
@@ -102,7 +102,7 @@ acceleration grid. Each leg contributes its integrated thrust to the existing
 mission budget alongside flyby patches:
 
 $$
-\Delta v_{\mathrm{LT}} = a\,T.
+\Delta v_{\mathrm{LT}} = a T.
 $$
 
 Endpoints remain approximate; the plotter replays selected legs and reports
