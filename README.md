@@ -92,8 +92,7 @@ uses a linearized response; here, first-order primer steering is paired with
 quadratic departure and arrival velocity estimates:
 
 $$
-\mathbf v_{\infty,k}(a) \approx \mathbf v_{\infty,k}^{(0)}
-+ a\,\mathbf s_{1,k} + \tfrac12 a^2\,\mathbf s_{2,k}, \qquad k\in\{D,A\}.
+\mathbf{v}_{\infty,k}(a) \approx \mathbf{v}_{\infty,k}^{(0)} + a\,\mathbf{s}_{1,k} + \frac{1}{2}a^2\,\mathbf{s}_{2,k}, \qquad k\in\{D,A\}.
 $$
 
 Here $a$ is the sampled constant acceleration, and $\mathbf s_{1,k}$ and
