@@ -110,6 +110,8 @@ their errors. See [earth_to_jupiter_lt.py](example/earth_to_jupiter_lt.py) for a
 small problem and [bepicolombo_lt.py](example/bepicolombo_lt.py) for a larger one.
 Both show the per-leg acceleration grid and specific impulse settings.
 
+See [LOW_THRUST_NOTE.md](LOW_THRUST_NOTE.md) for the derivation and implementation details.
+
 ```powershell
 uv run python star.py --problem earth_to_jupiter_lt --metakernel "star/METAKERN.tm"
 ```
